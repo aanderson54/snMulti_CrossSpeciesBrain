@@ -6,3 +6,7 @@ Understanding the gene regulatory mechanisms underlying brain function is crucia
 
 ### Code Availability
 All code generated for Anderson et al. 2025 is availble in this repository. Click [HERE](https://aanderson54.github.io/snMulti_CrossSpeciesBrain/index.html) to view code
+
+
+### Data Availability
+The raw and processed data generated are available through NCBI GEO under series accession number.
