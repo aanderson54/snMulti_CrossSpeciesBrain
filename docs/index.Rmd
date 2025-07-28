@@ -1,0 +1,4802 @@
+---
+title: "Single Cell Multiomics Across Nine Mammals Reveals Cell Type Specific Regulatory Conservation in the Brain"
+date: "2025-07-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: united
+---
+
+
+# snMultiomics WORKFLOW
+
+1. Run each 10x library through cell ranger arc with their corresponding reference
+2. Aggr if more than one sample per species
+3. Read into R (Seurat)
+4. Filter nuclei (nCount_ATAC, nCount_RNA, nFeature_RNA, etc)
+5. Normalize, dim reduction
+6. Remove Doublets
+7. Map cell types
+8. Call peaks with MACS2 by cell type
+9. Filter peak calls by -log10(q) > 3
+10. Combine peak list
+11. Call links using cell type peaks
+
+RNA - cross species comparison
+
+1. Convert gene names to common human gene name
+2. Combine count matrix across species using only genes that are shared across species
+3. Normalize, Dim Reduct
+
+ATAC - cross species comparison
+
+1. Convert all species peaks to hg38
+2. Create combined list of all peaks across species
+3. Liftover all peaks back to each species' regerence genome
+4. For each species count atac reads in the combined peaks for each cell type
+5. Combine count matrices across species
+6. Normalize, Dim Reduct
+
+
+# snMulti QC and Processing 
+
+Run for each species
+```{r, eval=F}
+
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(Azimuth)
+library(cicero)
+library(SeuratWrappers)
+library(SummarizedExperiment)
+
+
+
+species="foal"
+path="/cluster/projects/Cross_Species/snMultiomics/cellranger/original_batch/Foal/"
+
+seurat<-Read10X(paste0(path,"outs/filtered_feature_bc_matrix"))
+rna_counts<-seurat$`Gene Expression`
+atac_counts<-seurat$Peaks
+seurat<-CreateSeuratObject(rna_counts)
+grange.counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+frag.file <- paste0(path,"outs/atac_fragments.tsv.gz")
+chrom_assay<-CreateChromatinAssay(atac_counts, sep=c(":","-"), fragments = frag.file)
+seurat[["ATAC"]]<-chrom_assay
+seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+DefaultAssay(seurat)<-"ATAC"
+
+
+pdf(paste0("",species,"_vlnplot.pdf"))
+VlnPlot(seurat, features=c("nFeature_RNA","nCount_ATAC","nCount_RNA"), log=T, pt.size=0)
+dev.off()
+
+
+#initial filtering
+seurat2<-subset(seurat, subset =  nFeature_RNA > 500 & nCount_ATAC>200 & nCount_ATAC < quantile(seurat$nCount_ATAC, probs=0.98))
+
+#normalize and scale
+seurat2<-SCTransform(seurat2, vars.to.regress = c("percent.mt"),verbose=F) %>% RunPCA(ndims=30) %>% FindNeighbors(dims = 1:30) %>% 
+  RunUMAP(dims = 1:30, reduction.name="umap.rna", reduction.key = "rnaUMAP_") 
+DefaultAssay(seurat2)<-"ATAC"
+seurat2<-RunTFIDF(seurat2) 
+
+#remove doublets
+library(scDblFinder)
+library(SingleCellExperiment)
+DefaultAssay(seurat2)<-"SCT"
+sce<-as.SingleCellExperiment(seurat2)
+dbl<-computeDoubletDensity(sce)
+seurat2$isDbl<-ifelse(dbl<3.5,1,0)
+seurat2$dd<-dbl
+seurat2<-subset(seurat2, subset=isDbl==1) #191
+
+pdf(paste0("",species,"_markers.pdf"))
+FeaturePlot(seurat2, c("AQP4","NRGN","GAD1","CD74","MBP","VCAN"), reduction="umap.rna")
+FeaturePlot(seurat2, features=c("nCount_RNA","nCount_ATAC"), reduction="umap.rna")
+dev.off()
+
+
+
+# annotate cell types
+DefaultAssay(seurat2)<-"SCT"
+seurat2 <- RunAzimuth(seurat2, reference = "humancortexref", query.modality="SCT") #mousecortexref if mouse or rat
+
+
+
+
+library(ggplot2)
+pdf(paste0("",species,"_celltype_mapping-score.pdf"), width=10, height=6)
+df<-seurat2@meta.data
+ggplot(df, aes(x=predicted.cross_species_cluster.score))+geom_histogram()+theme_classic()
+ggplot(df, aes(x=predicted.cluster.score))+geom_histogram()+theme_classic()
+FeaturePlot(seurat2, features=c("predicted.cluster.score","predicted.cross_species_cluster.score"), reduction="umap.rna")
+seurat2$celltype<-ifelse(seurat2$predicted.id %in% c("GABAergic","Glutamatergic"), seurat2$predicted.class, seurat2$predicted.subclass)
+dev.off()
+pdf(paste0("",species,"_celltype_mapping-score_mathys_azimuth.pdf"), width=10, height=6)
+p1<-DimPlot(seurat2, group.by="predicted.subclass")
+p2<-DimPlot(seurat2, group.by="predicted.id")
+p1+p2
+df<-seurat2@meta.data
+ggplot(df, aes(x=predicted.id.score, y=predicted.subclass.score))+geom_point()+theme_classic()
+dev.off()
+
+
+#Setting low to allow for potentially species specific subtypes but don't want to allow for cell type doublets
+seurat2<-subset(seurat2, predicted.id.score>0.75) 
+
+seurat2<-FindClusters(seurat2, resolution=0.1)
+pdf(paste0("",species,"_clusters.pdf"), width=10, height=6)
+DimPlot(seurat2)
+dev.off()
+
+tab<-table(seurat2$seurat_clusters, seurat2$predicted.id)
+tmp<-colnames(tab)[apply(tab,1,which.max)]
+names(tmp)<-levels(seurat2)
+seurat2<-RenameIdents(seurat2,tmp)
+seurat2$cluster_celltype<-Idents(seurat2)
+seurat2$agree<-ifelse(seurat2$cluster_celltype==seurat2$predicted.id, 1,0)
+seurat2<-subset(seurat2, agree==1) #remove the cells that don't match the cell type of the rest of the cluster
+
+
+
+
+
+DefaultAssay(seurat2)<-"ATAC"
+CTpeaks<-CallPeaks(seurat2, macs2.path="miniconda3/envs/R/bin/macs2", group.by="predicted.id", combine.peaks=F, idents=c("Astrocytes","Excitatory","Inhibitory","Microglia","Oligodendrocytes","OPCs"))
+saveRDS(CTpeaks, paste0("~/cross_species/scAnalysis/",species,"/CTpeaks_list.rds"))
+
+CTpeaks2<-lapply(CTpeaks, function(x){
+  tmp<-x[which(x$neg_log10qvalue_summit>3),]
+  return(tmp)
+})
+gr.combined <- Reduce(f = c, x = CTpeaks2)
+gr <- reduce(x = gr.combined, with.revmap = TRUE)
+dset.vec <- vector(mode = "character", length = length(x = gr))
+ident.vec <- gr.combined$ident
+revmap <- gr$revmap
+for (i in seq_len(length.out = length(x = gr))) {
+  datasets <- ident.vec[revmap[[i]]]
+  dset.vec[[i]] <- paste(unique(x = datasets), collapse = ",")
+}
+gr$peak_called_in <- dset.vec
+gr$revmap <- NULL
+df <- as.data.frame(gr)
+#bed file for reanalyze [sort -k1,1 -k2,2n CT_peak_set.bed]
+write.table(df[,1:3], file=paste0("~/cross_species/scAnalysis/",species,"/CT_peak_set.bed"), quote=F, sep="\t", row.names=F, col.names=F)
+write.csv(df,paste0("~/cross_species/scAnalysis/",species,"CTpeaks_annotated.csv"))
+
+#Add counts to object
+macs2_counts<-FeatureMatrix(fragments=Fragments(seurat2), features=gr,cells=colnames(seurat2))
+seurat2[["CTpeaks"]]<-CreateChromatinAssay(counts=macs2_counts,  fragments=Fragments(seurat2))
+saveRDS(seurat2,paste0("~/cross_species/scAnalysis/",species,"/seurat.rds"))
+
+
+```
+
+## Ortholog table
+```{r, eval=F}
+library(biomaRt)
+
+ensembl = useEnsembl(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+tmp<-listAttributes(ensembl)
+rat<-tmp[grepl("Rat", tmp$description),1][c(1,2,9,11,12)]
+mouse<-tmp[grepl("Mouse", tmp$description),1][c(1,2,9,11,12)]
+rabbit<-tmp[grepl("Rabbit", tmp$description),1][c(1,2,9,11,12)]
+horse<-tmp[grepl("Horse", tmp$description),1][c(1,2,9,11,12)]
+cow<-tmp[grepl("Cow", tmp$description),1][c(1,2,9,11,12)]
+cat<-tmp[grepl("Cat", tmp$description),1][c(1,2,9,11,12)]
+mac<-tmp[grepl("Macaque", tmp$description),1][c(1,2,9,11,12)]
+marm<-tmp[grepl("marmoset", tmp$description),1][c(1,2,9,11,12)]
+
+
+gene <- getBM(attributes = c("hgnc_symbol", "ensembl_gene_id"), mart = ensembl)
+
+gene<-gene[!(grepl("^AL.+", gene$hgnc_symbol)),]
+gene<-gene[!(grepl("^AC.+", gene$hgnc_symbol)),]
+gene<-gene[!(grepl("-AS1", gene$hgnc_symbol)),]
+gene<-gene[!(grepl("MT-", gene$hgnc_symbol)),]
+gene<-gene[which(gene$hgnc_symbol!=""),]
+
+x<-seq_along(gene$hgnc_symbol)
+max<-200
+gene_list<-split(gene$ensembl_gene_id, ceiling(x/max))
+
+
+Gene_orth <- getBM(attributes=c('ensembl_gene_id', rat,mouse,rabbit,horse,cow,cat,mac,marm), mart = ensembl,filters =
+'ensembl_gene_id', values =gene_list[[1]])
+for(i in 2:length(gene_list)){ #need to split because biomaRt query will time out but can do consecutive queries
+  tryCatch({
+      tmp <- getBM(attributes=c('ensembl_gene_id', rat,mouse,rabbit,horse,cow,cat,mac,marm), filters =
+'ensembl_gene_id', values =gene_list[[i]], mart = ensembl)
+      Gene_orth<-rbind(Gene_orth, tmp)
+  }, error=function(e){e
+      print(paste("Oops! --> Error in Loop ",i,sep = ""))
+    })
+}
+
+
+
+Gene_orth2<-merge(Gene_orth, gene, by="ensembl_gene_id")
+
+write.csv(Gene_orth2, "~/cross_species/scAnalysis/Gene_orthologs_ensembl_ALL_species_FULL-010624.csv")
+```
+
+Liftover link calls with a 0.25 MR threshold. Redo overlap with the same stringent approach as before
+- limit liftovers to within 1kb of original size
+- limit to orthologs
+- limit to 200kb
+- limit to cor > 0.3
+- 2kb bins
+
+# Create Functional Conservation categories
+## Regulatory Overlap
+
+### Liftover
+```{bash, eval=F}
+conda activate ~/miniconda3/envs/CrossMap/
+
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/bosTau9ToHg38.over.chain.gz ~/cross_species/scAnalysis/calf/CT_peak_set.bed  cow_postliftover.bed
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/calJac4ToHg38.over.chain.gz ~/cross_species/scAnalysis/marmoset/CT_peak_set.bed  marmoset_postliftover.bed
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/equCab3ToHg38.over.chain.gz ~/cross_species/scAnalysis/foal/CT_peak_set.bed  horse_postliftover.bed
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/felCat9ToHg38.over.chain.gz ~/cross_species/scAnalysis/cat/CT_peak_set.bed  cat_postliftover.bed
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/oryCun2ToHg38.over.chain.gz ~/cross_species/scAnalysis/rabbit/CT_peak_set.bed  rabbit_postliftover.bed
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/mm10ToHg38.over.chain.gz ~/cross_species/scAnalysis/mouse/CT_peak_set.bed      mouse_postliftover.bed
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/rn7ToHg38.over.chain.gz ~/cross_species/scAnalysis/rat/CT_peak_set.bed      rat_postliftover.bed
+CrossMap.py region -r 0.25 cross_species/macaque/rheMac10ToHg38.over.chain.gz  ~/cross_species/scAnalysis/macaque/CT_peak_set.bed macaque_postliftover.bed 
+
+```
+
+### Merge
+```{r, eval=F}
+
+files<-as.list(readLines("cross_species/PEAKS/Check_allPeaks/CT_peaks_liftover_hg38.csv"))
+m<-sapply(strsplit(unlist(files), "/"),`[`,8)
+species<-gsub("_postliftover.bed", "", m)
+species<-c(species, "human")
+#files<-files[-8]
+PB<-lapply(files, function(x){
+  tmp<-read.table(x)
+  colnames(tmp)<-c("seqnames","start","end","MR")
+  tmp<-GRanges(tmp)
+  tmp$MR<-as.numeric(sapply(strsplit(tmp$MR,"="),`[`,2))
+  tmp<-tmp[which(width(tmp)<5000 & width(tmp)>200),] #peak can be max of 5kb and min of 200bp; limit determined by human peak sizes
+})
+
+hg38<-import("~/human/CT_filtered_peaks.bed")
+hg38$MR<-1
+PB[[9]]<-hg38
+
+for(i in 1:length(PB)){
+  PB[[i]]$species<-species[i]
+}
+
+seqlevelsStyle(PB[[1]])<-"ucsc"
+seqlevelsStyle(PB[[3]])<-"ucsc"
+
+
+
+
+PEAKS<-do.call(c, PB)
+PEAKS<-resize(PEAKS, width=1000, fix="center") 
+PEAKS.rd<-reduce(PEAKS)
+#split large peaks into bins
+large_peaks <- PEAKS.rd[width(PEAKS.rd) > 2000] 
+binned_peaks <- unlist(tile(large_peaks, width=2000))
+small_peaks <- PEAKS.rd[width(PEAKS.rd) <= 2000]
+final_peaks <- c(small_peaks, binned_peaks)
+PEAKS.rd <- sort(final_peaks)
+PEAKS.rd$index<-seq(1,length(PEAKS.rd))
+
+
+# overlap each peak back with non-reduced peaks to pull the list of species 
+PEAKS<-do.call(c, PB)
+PEAKS<-resize(PEAKS, width=1000, fix="center") 
+ol<-findOverlaps(PEAKS, PEAKS.rd)
+PEAKS<-PEAKS[queryHits(ol)]
+PEAKS$index<-NA
+PEAKS$index<-PEAKS.rd[subjectHits(ol)]$index
+df<-as.data.frame(PEAKS) %>% group_by(index) %>% summarize(species=paste0(sort(unique(species)), collapse="&"))
+PEAKS.rd<-GRanges(merge(PEAKS.rd, df, by="index"))
+
+
+```
+
+
+### Classify Conservation
+```{r, eval=F}
+#order of species in peak list
+species_map<-data.frame(species, class=c("mammal","mammal","mammal","primate","primate","mammal","mammal","mammal","human"))
+
+# Function to classify conservation level for each peak
+classify_conservation <- function(species_str) {
+  # Split the string by "&" and get unique species names
+  sp <- unique(unlist(str_split(species_str, "&")))
+  sp <- sp[sp != ""]  # Remove any empty strings
+  
+  # 1. If the peak is called only in human -> human-specific
+  if(identical(sort(sp), "human")) {
+    return("human-specific")
+  }
+  # 2. Ultra conserved: if the peak is called in all species (all 9 species present)
+  all_species <- sort(species_map$species)
+  if(identical(sort(sp), all_species)) {
+    return("ultra-conserved")
+  }
+  # Check that human is present; if not, we return NA
+  if(!("human" %in% sp)) {
+    return("Non-human")
+  }
+  # Get the class (mammal/primate/human) for each species in the peak
+  sp_classes <- species_map$class[match(sp, species_map$species)]
+  # 3. Conserved in primates: if human + at least one primate and no non-primate mammals
+  if(any(sp_classes == "primate") && !any(sp_classes == "mammal")) {
+    return("primate-conserved")
+  }
+  # 4. Conserved in mammals: if human + at least one primate + at least one non-primate mammal
+  if(any(sp_classes == "primate") && any(sp_classes == "mammal")) {
+    return("mammal-conserved")
+  }
+  # If none of the rules match, return"other"
+  return("other")
+}
+
+
+
+
+# Apply the classification function to the peak list
+tmp <- as.data.frame(PEAKS.rd) %>%
+  mutate(conservation = sapply(species, classify_conservation))
+
+PEAKS.rd<-GRanges(tmp)
+
+
+
+
+
+
+
+
+
+# Define a function to map original labels to numeric conservation levels
+# Levels: 1 = human-specific, 2 = primate, 3 = mammal, 4 = ultra, 0 = not in human
+map_class <- function(x) {
+  if (x == "human-specific") {
+    return(1)
+  } else if (x == "primate-conserved") {
+    return(2)
+  }else if (x == "other"){ #this may need some revision
+      return(2.5)
+  } else if (x == "mammal-conserved") {
+    return(3)
+  } else if (x == "ultra-conserved") {
+    return(4)
+  } else if (x == "Non-human") {
+    return(0)
+  } else {
+    return(NA)
+  }
+}
+
+
+
+
+df <- as.data.frame(PEAKS.rd[,-c(6,7)]) %>%
+  mutate(F_level = sapply(conservation, map_class),
+    F_name = ifelse(F_level == 0, "R0", paste0("F", F_level)))
+PEAKS.rd<-GRanges(df)
+
+```
+
+
+### Annotate
+```{r, eval=F}
+
+# Overlap with ENCODE4 annotations. Prioritize PLS
+enc4<-read.table("~/cross_species/GRCh38-cCREs_SCREENv4.bed")
+colnames(enc4)<-c("seqnames","start","end","ID1","ID2","cCRE")
+enc4<-GRanges(enc4)
+
+  # Find overlaps
+PEAKS.rd$CCRE <- "None"
+ol <- findOverlaps(PEAKS.rd, enc4)
+annotation_df <- data.frame(peak_index = queryHits(ol),  annotation = enc4$cCRE[subjectHits(ol)])
+priority_levels <- c("PLS", "pELS", "dELS", "CA", "CA-CTCF","CA-H3K4me3", "CA-TF", "TF"   ) # Prioritize annotations (e.g., "PLS" is more important)
+annotation_df$priority <- match(annotation_df$annotation, priority_levels)
+
+final_annotations <- annotation_df %>%  group_by(peak_index) %>%  slice_min(order_by = priority, n = 1) %>%  ungroup()
+PEAKS.rd$CCRE[final_annotations$peak_index] <- final_annotations$annotation
+
+
+
+
+
+
+
+# Overlap TEs
+tes<-read.table("~/cross_species/external_data/TEs/rmsk.hg38.txt")
+colnames(tes)[c(6,7,8,12)]<-c("seqnames","start","end","TE")
+tes<-GRanges(tes)
+tes$TE<-gsub("?","", tes$TE, fixed=T)
+
+ol<-findOverlaps(PEAKS.rd, tes)
+PEAKS.rd$rmsk<-"None"
+PEAKS.rd[queryHits(ol)]$rmsk<-tes[subjectHits(ol)]$TE
+
+
+
+
+
+
+# G1/G2/G3
+ccre<-GRanges(read.csv("~/Andrew23-37104580_cCRE_class_conservation.csv"))
+ol<-findOverlaps(PEAKS.rd, ccre)
+PEAKS.rd$cCRE_class<-"None"
+PEAKS.rd[queryHits(ol)]$cCRE_class<-ccre[subjectHits(ol)]$Group
+
+
+
+# phyloP
+phyloP_data <- import("cross_species/external_data/cactus241way.phyloP.bw", which = PEAKS.rd)
+
+# Find overlaps between peaks and phyloP scores
+ov <- findOverlaps(PEAKS.rd, phyloP_data)
+
+# Create a data.frame with the peak index and the corresponding phyloP score
+df <- data.frame(
+  peak_index = queryHits(ov),
+  score = mcols(phyloP_data)$score[subjectHits(ov)]
+)
+
+#  For each peak, compute the average phyloP and determine the value with maximum absolute score.
+# The following function returns the score that has the highest absolute value.
+max_abs <- function(x) {
+  x[which.max(abs(x))]
+}
+
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(
+    mean_phyloP = mean(score, na.rm = TRUE),
+    maxabs_phyloP = max_abs(score)
+  )
+
+#  Add these computed values back to your peaks GRanges object.
+# Initialize metadata columns with NA (for peaks with no overlapping phyloP score)
+PEAKS.rd$mean_phyloP <- NA_real_
+PEAKS.rd$maxabs_phyloP <- NA_real_
+
+PEAKS.rd$mean_phyloP[res$peak_index] <- res$mean_phyloP
+PEAKS.rd$maxabs_phyloP[res$peak_index] <- res$maxabs_phyloP
+
+
+
+
+# phyloP
+phast_data <- import("~/cross_species/external_data/hg38.phastCons470way.bw", which = PEAKS.rd)
+
+# 3. Find overlaps between peaks and phastCons scores
+ov <- findOverlaps(PEAKS.rd, phast_data)
+
+# Create a data.frame with the peak index and the corresponding  score
+df <- data.frame(
+  peak_index = queryHits(ov),
+  score = mcols(phast_data)$score[subjectHits(ov)]
+)
+
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(
+    mean_phast = mean(score, na.rm = TRUE)
+  )
+
+# Add these computed values back to your peaks GRanges object.
+# Initialize metadata columns with NA (for peaks with no overlapping phastCons score)
+PEAKS.rd$mean_phast <- NA
+PEAKS.rd$mean_phast[res$peak_index] <- res$mean_phast
+
+
+
+# for liftover to each species
+write.table(as.data.frame(PEAKS.rd[,1]), "~/cross_species/PEAKS/PB_resize1kb_bin2kb/PEAKS_forliftover.bed", quote=F, row.names=F, col.names=F, sep="\t")
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+## Target Overlap
+
+- Do this for each species:
+  - run cellranger arc reanalyze for each species using the cell type-specific MACS2 calls and only nuclei retained after QC filtering
+  - read in feature linkage calls from each species
+  - split out strings to get GRange compatable format
+```{r, eval=F}
+marmoset<-import("/cross_species/LINKS/reanalyze_marmoset//outs/analysis/feature_linkage/feature_linkage.bedpe")
+marmoset<-marmoset[mcols(marmoset)$NA..2 !="peak-peak",]
+marmoset<-as.data.frame(marmoset)
+marmoset$A1<-sapply(strsplit(marmoset$name,"><"),`[`,1)
+marmoset$A2<-sapply(strsplit(marmoset$name,"><"),`[`,2)
+marmoset$A1<-gsub("<","", marmoset$A1)
+marmoset$A2<-gsub(">","", marmoset$A2)
+
+
+
+tmp<-data.frame(
+  seqnames=ifelse(marmoset$NA..2=="peak-gene", marmoset$first.seqnames, marmoset$second.seqnames),
+  start=ifelse(marmoset$NA..2=="peak-gene", marmoset$first.start, marmoset$second.start),
+  end=ifelse(marmoset$NA..2=="peak-gene", marmoset$first.end, marmoset$second.end),
+  gene=ifelse(marmoset$NA..2=="peak-gene", marmoset$A2, marmoset$A1),
+  marmoset.score=marmoset$score,
+  marmoset.q=marmoset$NA. ,
+  marmoset.dist=marmoset$NA..1
+)
+tmp$original.seqnames<-tmp$seqnames
+tmp$original.start<-tmp$start
+tmp$original.end<-tmp$end
+tmp<-GRanges(tmp)
+tmp<-tmp[which(tmp$marmoset.dist<=200000),]
+tmp<-tmp[which(abs(tmp$marmoset.score)>0.3),]
+write.table(tmp, "~/cross_species/LINKS/liftover/REGION_lift/marmoset_toliftover.bed", quote=F, row.names=F, col.names=F, sep="\t")
+
+
+```
+
+
+### Liftover
+```{bash, eval=F}
+conda activate ~/miniconda3/envs/CrossMap/
+
+
+
+CrossMap.py region -r 0.25 cross_species/horse/equCab3ToHg38.over.chain.gz  foal_toliftover.bed foal_postliftover.bed 
+
+CrossMap.py region -r 0.25 cross_species/cat/felCat9ToHg38.over.chain.gz cat_toliftover.bed cat_postliftover.bed
+
+CrossMap.py region -r 0.25 cross_species/marmoset/calJac4ToHg38.over.chain.gz  marmoset_toliftover.bed marmoset_postliftover.bed 
+
+CrossMap.py region -r 0.25 cross_species/rabbit/oryCun2ToHg38.over.chain.gz  rabbit_toliftover.bed rabbit_postliftover.bed 
+
+CrossMap.py region -r 0.25 cross_species/rat/rn7ToHg38.over.chain.gz  rat_toliftover.bed rat_postliftover.bed 
+
+CrossMap.py region -r 0.25 cross_species/macaque/rheMac10ToHg38.over.chain.gz  macaque_toliftover.bed macaque_postliftover.bed 
+
+
+CrossMap.py region -r 0.25 cross_species/cow/bosTau9ToHg38.over.chain.gz  calf_toliftover.bed calf_postliftover.bed 
+
+CrossMap.py region -r 0.25 cross_species/mouse/mm10ToHg38.over.chain.gz   mouse_toliftover.bed mouse_postliftover.bed 
+
+CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/rn7ToHg38.over.chain.gz rat_toliftover.bed      rat_postliftover.bed
+
+```
+
+
+### Processing
+
+
+
+```{r, eval=F}
+
+m1<-read.table("~/cross_species//LINKS/liftover/REGION_0.25/foal_postliftover.bed")
+colnames(m1)<-c("seqnames","start","end","wdith","strand","gene","foal.score","foal.q","foal.dist","original.seq","original.start","original.end", "Map")
+m1$seqnames<-paste0("chr", m1$seqnames)
+m1<-m1[which(m1$foal.dist<=200000),]
+m1<-m1[which(abs(m1$foal.score)>0.3),]
+
+
+m2<-read.table("~/cross_species//LINKS/liftover/REGION_0.25/cat_postliftover.bed")
+colnames(m2)<-c("seqnames","start","end","wdith","strand","gene","cat.score","cat.q","cat.dist","original.seq","original.start","original.end", "Map")
+m2$seqnames<-paste0("chr", m2$seqnames)
+m2<-m2[which(m2$cat.dist<=200000),]
+m2<-m2[which(abs(m2$cat.score)>0.3),]
+
+
+m3<-read.table("~/cross_species//LINKS/liftover/REGION_0.25/rabbit_postliftover.bed")
+colnames(m3)<-c("seqnames","start","end","wdith","strand","gene","rabbit.score","rabbit.q","rabbit.dist","original.seq","original.start","original.end", "Map")
+m3<-m3[which(m3$rabbit.dist<=200000),]
+m3<-m3[which(abs(m3$rabbit.score)>0.3),]
+
+m4<-read.table("~/cross_species/LINKS/liftover/REGION_0.25/macaque_postliftover.bed")
+colnames(m4)<-c("seqnames","start","end","wdith","strand","gene","macaque.score","macaque.q","macaque.dist","original.seq","original.start","original.end", "Map")
+m4<-m4[which(m4$macaque.dist<=200000),]
+m4<-m4[which(abs(m4$macaque.score)>0.3),]
+
+
+m5<-read.table("~/cross_species/LINKS/liftover/REGION_0.25/calf_postliftover.bed")
+colnames(m5)<-c("seqnames","start","end","wdith","strand","gene","calf.score","calf.q","calf.dist","original.seq","original.start","original.end", "Map")
+m5$seqnames<-paste0("chr", m5$seqnames)
+m5<-m5[which(m5$calf.dist<=200000),]
+m5<-m5[which(abs(m5$calf.score)>0.3),]
+
+m6<-read.table("~/cross_species/LINKS/liftover/REGION_0.25/mouse_postliftover.bed")
+colnames(m6)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end", "Map")
+m6$seqnames<-paste0("chr", m6$seqnames)
+m6<-m6[which(m6$mouse.dist<=200000),]
+m6<-m6[which(abs(m6$mouse.score)>0.3),]
+
+m7<-read.table("~/cross_species//LINKS/liftover/REGION_0.25/marmoset_postliftover.bed")
+colnames(m7)<-c("seqnames","start","end","wdith","strand","gene","marmoset.score","marmoset.q","marmoset.dist","original.seq","original.start","original.end","Map")
+m7<-m7[which(m7$marmoset.dist<=200000),]
+m7$seqnames<-paste0("chr", m7$seqnames)
+m7<-m7[which(abs(m7$marmoset.score)>0.3),]
+
+m8<-read.table("~/cross_species//LINKS/liftover/REGION_0.25/rat_postliftover.bed")
+colnames(m8)<-c("seqnames","start","end","wdith","strand","gene","rat.score","rat.q","rat.dist","original.seq","original.start","original.end", "Map")
+m8<-m8[which(m8$rat.dist<=200000),]
+m8$seqnames<-paste0("chr", m8$seqnames)
+m8<-m8[which(abs(m8$rat.score)>0.3),]
+
+
+
+
+m9<-readRDS("~/cross_species/LINKS/Human_links.hg38.rds")
+
+```
+
+
+
+
+```{r, eval=F}
+orth<-read.csv("~/cross_species/scAnalysis/orthologs/Gene_orthologs_ensembl_ALL_species_FULL-012324.csv")
+
+#merge with the gene id or name to get human gene name equivalent. Some species links are by gene id and some are by name
+m1<-GRanges(merge(m1, orth[,c(19,43)], by.x="gene",by.y="ecaballus_homolog_associated_gene_name", all.x=T))   #calf
+m2<-GRanges(merge(m2, orth[,c(29,43)], by.x="gene",by.y="fcatus_homolog_associated_gene_name", all.x=T))      #cat
+m3<-GRanges(merge(m3, orth[,c(14,43)], by.x="gene",by.y="ocuniculus_homolog_associated_gene_name", all.x=T))  #rabbit
+m4<-GRanges(merge(m4, orth[,c(34,43)], by.x="gene",by.y="mmulatta_homolog_associated_gene_name", all.x=T))    #macaque
+m5<-GRanges(merge(m5, orth[,c(24,43)], by.x="gene",by.y="btaurus_homolog_associated_gene_name", all.x=T))     #calf
+m6<-GRanges(merge(m6, orth[,c(9,43)], by.x="gene",by.y="mmusculus_homolog_associated_gene_name", all.x=T))     #mouse
+m7<-GRanges(merge(m7, orth[,c(39,43)], by.x="gene",by.y="cjacchus_homolog_associated_gene_name", all.x=T))     #marmoset
+m8<-GRanges(merge(m8, orth[,c(4,43)], by.x="gene",by.y="rnorvegicus_homolog_associated_gene_name", all.x=T))     #rat
+
+
+m1<-GRanges(merge(m1, orth[,c(18,43)], by.x="gene",by.y="ecaballus_homolog_ensembl_gene", all.x=T)) #gene name
+m2<-GRanges(merge(m2, orth[,c(28,43)], by.x="gene",by.y="fcatus_homolog_ensembl_gene", all.x=T)) #gene name
+m3<-GRanges(merge(m3, orth[,c(13,43)], by.x="gene",by.y="ocuniculus_homolog_ensembl_gene", all.x=T)) #gene name
+m4<-GRanges(merge(m4, orth[,c(33,43)], by.x="gene",by.y="mmulatta_homolog_ensembl_gene", all.x=T)) #gene id
+m5<-GRanges(merge(m5, orth[,c(23,43)], by.x="gene",by.y="btaurus_homolog_ensembl_gene", all.x=T)) #gene name
+m6<-GRanges(merge(m6, orth[,c(8,43)], by.x="gene",by.y="mmusculus_homolog_ensembl_gene", all.x=T))     #mouse
+m7<-GRanges(merge(m7, orth[,c(38,43)], by.x="gene",by.y="cjacchus_homolog_ensembl_gene", all.x=T))     #marmoset
+m8<-GRanges(merge(m8, orth[,c(3,43)], by.x="gene",by.y="rnorvegicus_homolog_ensembl_gene", all.x=T))     #rat
+
+#remove links where there is not a human ortholog
+m1$gene<-toupper(ifelse(is.na(m1$hgnc_symbol.x)==F,m1$hgnc_symbol.x, ifelse(is.na(m1$hgnc_symbol.y)==F,m1$hgnc_symbol.y, m1$gene )))
+m2$gene<-toupper(ifelse(is.na(m2$hgnc_symbol.x)==F,m2$hgnc_symbol.x, ifelse(is.na(m2$hgnc_symbol.y)==F,m2$hgnc_symbol.y, m2$gene )))
+m3$gene<-toupper(ifelse(is.na(m3$hgnc_symbol.x)==F,m3$hgnc_symbol.x, ifelse(is.na(m3$hgnc_symbol.y)==F,m3$hgnc_symbol.y, m3$gene )))
+m4$gene<-toupper(ifelse(is.na(m4$hgnc_symbol.x)==F,m4$hgnc_symbol.x, ifelse(is.na(m4$hgnc_symbol.y)==F,m4$hgnc_symbol.y, m4$gene )))
+m5$gene<-toupper(ifelse(is.na(m5$hgnc_symbol.x)==F,m5$hgnc_symbol.x, ifelse(is.na(m5$hgnc_symbol.y)==F,m5$hgnc_symbol.y, m5$gene )))
+m6$gene<-toupper(ifelse(is.na(m6$hgnc_symbol.x)==F,m6$hgnc_symbol.x, ifelse(is.na(m6$hgnc_symbol.y)==F,m6$hgnc_symbol.y, m6$gene )))
+m7$gene<-toupper(ifelse(is.na(m7$hgnc_symbol.x)==F,m7$hgnc_symbol.x, ifelse(is.na(m7$hgnc_symbol.y)==F,m7$hgnc_symbol.y, m7$gene )))
+m8$gene<-toupper(ifelse(is.na(m8$hgnc_symbol.x)==F,m8$hgnc_symbol.x, ifelse(is.na(m8$hgnc_symbol.y)==F,m8$hgnc_symbol.y, m8$gene )))
+
+m1$hgnc_symbol<-toupper(ifelse(is.na(m1$hgnc_symbol.x)==F,m1$hgnc_symbol.x, ifelse(is.na(m1$hgnc_symbol.y)==F,m1$hgnc_symbol.y, "NoOrth" )))
+m2$hgnc_symbol<-toupper(ifelse(is.na(m2$hgnc_symbol.x)==F,m2$hgnc_symbol.x, ifelse(is.na(m2$hgnc_symbol.y)==F,m2$hgnc_symbol.y, "NoOrth" )))
+m3$hgnc_symbol<-toupper(ifelse(is.na(m3$hgnc_symbol.x)==F,m3$hgnc_symbol.x, ifelse(is.na(m3$hgnc_symbol.y)==F,m3$hgnc_symbol.y, "NoOrth" )))
+m4$hgnc_symbol<-toupper(ifelse(is.na(m4$hgnc_symbol.x)==F,m4$hgnc_symbol.x, ifelse(is.na(m4$hgnc_symbol.y)==F,m4$hgnc_symbol.y, "NoOrth" )))
+m5$hgnc_symbol<-toupper(ifelse(is.na(m5$hgnc_symbol.x)==F,m5$hgnc_symbol.x, ifelse(is.na(m5$hgnc_symbol.y)==F,m5$hgnc_symbol.y, "NoOrth" )))
+m6$hgnc_symbol<-toupper(ifelse(is.na(m6$hgnc_symbol.x)==F,m6$hgnc_symbol.x, ifelse(is.na(m6$hgnc_symbol.y)==F,m6$hgnc_symbol.y, "NoOrth" )))
+m7$hgnc_symbol<-toupper(ifelse(is.na(m7$hgnc_symbol.x)==F,m7$hgnc_symbol.x, ifelse(is.na(m7$hgnc_symbol.y)==F,m7$hgnc_symbol.y, "NoOrth" )))
+m8$hgnc_symbol<-toupper(ifelse(is.na(m8$hgnc_symbol.x)==F,m8$hgnc_symbol.x, ifelse(is.na(m8$hgnc_symbol.y)==F,m8$hgnc_symbol.y, "NoOrth" )))
+
+
+
+
+m9$hgnc_symbol<-toupper(m9$hgnc_symbol)
+links_list<-list(m1,m2,m3,m4,m5, m6, m7, m8, m9)
+common_genes <- Reduce(intersect, lapply(links_list, function(gr) gr$hgnc_symbol)) 
+
+# only keep genes that are found in at least 2 species. Using this approach to eliminate all species-specific pseudogenes
+unique_genes_list <- lapply(links_list, function(gr) unique(gr$gene))
+all_genes <- unlist(unique_genes_list)
+gene_counts <- table(all_genes)
+genes_at_least2 <- names(gene_counts[gene_counts >= 2]) #12467
+
+m1<-m1[which(m1$gene %in% genes_at_least2),]
+m2<-m2[which(m2$gene %in% genes_at_least2),]
+m3<-m3[which(m3$gene %in% genes_at_least2),]
+m4<-m4[which(m4$gene %in% genes_at_least2),]
+m5<-m5[which(m5$gene %in% genes_at_least2),]
+m6<-m6[which(m6$gene %in% genes_at_least2),]
+m7<-m7[which(m7$gene %in% genes_at_least2),]
+m8<-m8[which(m8$gene %in% genes_at_least2),]
+m9<-m9[which(m9$gene %in% genes_at_least2),]
+
+#Remove duplicate links. This is due to repeat lines in the ortholog file from multiple species comparisons
+##create unique identities. 
+m1$uniq<-paste0(m1$original.start,"-",m1$gene)
+m2$uniq<-paste0(m2$original.start,"-",m2$gene)
+m3$uniq<-paste0(m3$original.start,"-",m3$gene)
+m4$uniq<-paste0(m4$original.start,"-",m4$gene)
+m5$uniq<-paste0(m5$original.start,"-",m5$gene)
+m6$uniq<-paste0(m6$original.start,"-",m6$gene)
+m7$uniq<-paste0(m7$original.start,"-",m7$gene)
+m8$uniq<-paste0(m8$original.start,"-",m8$gene)
+
+##remove
+m1.2<-m1[!(duplicated(m1$uniq)),]
+m2.2<-m2[!(duplicated(m2$uniq)),]
+m3.2<-m3[!(duplicated(m3$uniq)),]
+m4.2<-m4[!(duplicated(m4$uniq)),]
+m5.2<-m5[!(duplicated(m5$uniq)),]
+m6.2<-m6[!(duplicated(m6$uniq)),]
+m7.2<-m7[!(duplicated(m7$uniq)),]
+m8.2<-m8[!(duplicated(m8$uniq)),]
+
+
+
+
+
+
+
+
+```
+
+
+### Merge
+
+
+```{r, eval=F}
+
+links_list<-list(m1.2,m2.2,m3.2,m4.2,m5.2, m6.2, m7.2, m8.2)
+species_names<-c("horse","cat","rabbit","macaque","cow", "mouse", "marmoset", "rat")
+for(i in 1:length(links_list)){
+  links_list[[i]]$species<-species_names[i]
+  links_list[[i]]<-links_list[[i]][which(width(links_list[[i]]) < links_list[[i]]$wdith+1000), ] #remove incorrect liftovers
+  links_list[[i]]<-links_list[[i]][which(width(links_list[[i]])<5000 & width(links_list[[i]])>200),] #match peak filters
+  links_list[[i]]<-resize(links_list[[i]], width=1000, fix="center")  #match peak resize
+}
+
+m9<-resize(m9, width=1000, fix="center")
+links_list[[i+1]]<-m9
+species_names<-c(species_names,"human")
+
+```
+
+
+
+```{r, eval=F}
+links<-do.call(c, links_list)
+
+ol<-findOverlaps(links,PEAKS.rd)
+LINKS<-PEAKS.rd[subjectHits(ol)]
+LINKS$gene<-links[queryHits(ol)]$gene
+LINKS$link<-paste0(LINKS$index,"_",LINKS$gene)
+LINKS<-LINKS[!(duplicated(LINKS$link)),]
+
+#species_names<-c("horse","cat","rabbit","macaque","cow", "mouse", "marmoset", "rat", "human")
+for(i in 1:length(species_names)){
+  if(i < length(species_names)){
+    links_list[[i]]$index<-NA
+    ol<-findOverlaps(links_list[[i]], PEAKS.rd)
+    tmp<-links_list[[i]][queryHits(ol)]
+    tmp$index<-PEAKS.rd[subjectHits(ol)]$index #splitting this out to allow for a peak to overlap multiple binned peaks
+    tmp$link<-paste0(tmp$index,"_", tmp$gene)
+    colnames(mcols(tmp))[9]<-paste0(species_names[[i]],".liftover")
+    tmp<-tmp[!(duplicated(tmp$link)),]
+    LINKS<-merge(LINKS, as.data.frame(tmp)[,c(8,9,10,14,6,20,21)], by=c("link", "index","gene"), all=T)
+  }
+  else{
+    links_list[[i]]$index<-NA
+    ol<-findOverlaps(links_list[[i]], PEAKS.rd)
+    tmp<-links_list[[i]][queryHits(ol)]
+    tmp$index<-PEAKS.rd[subjectHits(ol)]$index
+    tmp$link<-paste0(tmp$index,"_", tmp$gene)
+    names(tmp)<-NULL
+    LINKS<-merge(LINKS, as.data.frame(tmp)[,-c(1,2,3,4,5,14,15)], by=c("link", "index","gene"), all=T)
+  }
+}
+
+
+
+ol<-findOverlaps(links,PEAKS.rd)
+links$index<-NA
+links<-links[queryHits(ol)]
+links$index<-PEAKS.rd[subjectHits(ol)]$index
+links$link<-paste0(links$index,"_", links$gene)
+names(links)<-NULL
+df<- as.data.frame(links) %>% group_by(link) %>% summarize(species=paste0(sort(unique(species)), collapse="&" ))
+df2<- as.data.frame(links) %>% group_by(index) %>% summarize(species_PEAK=paste0(sort(unique(species)), collapse="&" ))
+colnames(df)[2]<-"species.link"
+colnames(df2)[2]<-"species.peak"
+
+LINKS<-merge(LINKS, df, by="link")
+LINKS<-merge(LINKS, df2, by="index")
+LINKS<-LINKS[!(duplicated(LINKS$link)),]
+
+LINKS$Num_species<-str_count(LINKS$species.peak, "&")+1
+LINKS$Num_species_linkedPeak<-str_count(LINKS$species.link,"&")+1
+
+
+
+```
+
+### Annotate
+```{r, eval=F}
+# ADD RVIS score
+rvis<-read.csv("~/cross_species/external_data/RVIS-score_Petrovski2013.csv")
+LINKS2<-GRanges(merge(LINKS, rvis, by.x="gene", by.y="HGNC.gene", all.x=T))
+LINKS2<-LINKS2[!(duplicated(LINKS2$link)),]
+
+
+
+
+
+species_map<-data.frame(species_names, class=c("mammal","mammal","mammal","primate","mammal","mammal","primate","mammal","human"))
+
+# Function to classify conservation level for each peak
+classify_conservation <- function(species_str) {
+  # Split the string by "&" and get unique species names
+  sp <- unique(unlist(str_split(species_str, "&")))
+  sp <- sp[sp != ""]  # Remove any empty strings
+  
+  # 1. If the peak is called only in human -> human-specific
+  if(identical(sort(sp), "human")) {
+    return("human-specific")
+  }
+  # 2. Ultra conserved: if the peak is called in all species (all 9 species present)
+  all_species <- sort(species_map$species)
+  if(identical(sort(sp), all_species)) {
+    return("ultra-conserved")
+  }
+  # Check that human is present; if not, we return NA
+  if(!("human" %in% sp)) {
+    return("Non-human")
+  }
+  # Get the class (mammal/primate/human) for each species in the peak
+  sp_classes <- species_map$class[match(sp, species_map$species)]
+  # 3. Conserved in primates: if human + at least one primate and no non-primate mammals
+  if(any(sp_classes == "primate") && !any(sp_classes == "mammal")) {
+    return("primate-conserved")
+  }
+  # 4. Conserved in mammals: if human + at least one primate + at least one non-primate mammal
+  if(any(sp_classes == "primate") && any(sp_classes == "mammal")) {
+    return("mammal-conserved")
+  }
+  # If none of the rules match, return"other"
+  return("other")
+}
+
+
+
+# What is the classification of the link?
+tmp <- as.data.frame(LINKS) %>%
+  mutate(Link_cons = sapply(species.link, classify_conservation))
+#check<-GRanges(tmp[which(tmp$Link_cons=="human-specific" & tmp$conservation=="Non-human"),]) #good
+
+
+
+LINKS<-GRanges(tmp)
+
+```
+
+### Classify Conservation
+```{r, eval=F}
+
+# Define a function to map original labels to numeric conservation levels
+# Levels: 1 = human-specific, 2 = primate, 3 = mammal, 4 = ultra, 0 = not in human
+map_class <- function(x) {
+  if (x == "human-specific") {
+    return(1)
+  } else if (x == "primate-conserved") {
+    return(2)
+  } else if (x %in%  c("mammal-conserved", "other")) {
+    return(3)
+  } else if (x == "ultra-conserved") {
+    return(4)
+  } else if (x == "Non-human") {
+    return(0)
+  } else {
+    return(NA)
+  }
+}
+
+# Apply the mapping function to generate numeric levels for both peaks and links,
+# then create new labels (R0, R1, etc. for peaks and T0, T1, etc. for links).
+# Also, flag cases where the peak and link levels disagree (and both are > 0) as outliers.
+df <- as.data.frame(LINKS) %>%
+  mutate(
+    T_level = sapply(Link_cons, map_class),
+    F_level = as.numeric(gsub("F","", F_mod)),
+    T_name = ifelse(T_level == 0, "T0", paste0("T", T_level)),
+    combined = ifelse(F_level < T_level | (F_level==1 & T_level!=1 ),    "outlier", paste0(F_mod, "-", T_name))
+  )
+
+
+#LINKS<-GRanges(df[,-c(62,63,64,65)])
+LINKS<-GRanges(df[,-c(13,14,16,18,20,22,23,26,29,30,31,33,36,41,42,87)])
+
+
+LINKS$T_mod<-ifelse(LINKS$T_mod=="T4" & LINKS$F_mod=="R3","T3",LINKS$T_mod)
+f<-as.numeric(gsub("F","", LINKS$F_mod))
+t<-as.numeric(gsub("T","", LINKS$T_mod))
+LINKS$T_mod<-ifelse(t>f, paste0("T",f),LINKS$T_mod)
+
+
+```
+
+
+
+# Regulatory Conservation
+
+## Summary
+
+### Number cCREs
+```{r, eval=F}
+
+Dab<-as.data.frame(table(PEAKS.rd$F_mod))
+Dab$Function<-Dab$Var1
+#Dab$Var1<-factor(Dab$Var1, levels=rev(c(unique(Dab$Var1)[-1],Dab$Var1[1])))
+pdf("Num_PEAKS_by_category.pdf", width=5,height=3)
+ggplot(Dab, aes(x=Function, y=log10(Freq), fill=Var1))+geom_bar(stat="identity")+theme_classic()+theme(legend.position="none")+xlab("Degree of peak conservation")+ylab("log10(Num peaks)")
+dev.off()
+
+```
+
+
+```{r, eval=F}
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(ChIPseeker)
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+peaks.Annp<-annotatePeak(PEAKS.rd, TxDb=txdb, tssRegion=c(-1000,100))
+df<-peaks.Annp@anno
+df$Annot<-sapply(strsplit(as.character(df$annotation)," "),`[`,1)
+df$Annot<-ifelse(df$Annot=="Downstream","Distal",df$Annot)
+
+prop<-as.data.frame(prop.table(table(df$F_name, df$Annot),1))
+prop$Var2<-factor(prop$Var2, levels=c("Promoter","Distal","Intron","Exon","3'","5'"))
+pdf("PEAK_stats_ChIPseeker-annotation.pdf", width=6,height=3)
+ggplot(prop, aes(y=Var1, x=Freq, fill=Var2))+geom_bar(stat="identity")+theme_classic()+scale_fill_brewer(type = "seq", palette = 2, direction=-1)
+dev.off()
+```
+
+### phastCons
+```{r, eval=F}
+pdf("phyloP_byCons.pdf")
+ggplot(as.data.frame(PEAKS.rd), aes(x=mean_phyloP, fill=F_mod))+geom_density(alpha=0.6)+theme_classic()+scale_fill_manual(values=c("R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R3"= "#619CFF","R4"= "#F564E3"))
+dev.off()
+
+pdf("phastCons_byCons.pdf")
+ggplot(as.data.frame(PEAKS.rd), aes(x=phast_max, fill=F_mod))+geom_density(alpha=0.6)+theme_classic()+scale_fill_manual(values=c("R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R3"= "#619CFF","R4"= "#F564E3"))+facet_wrap(~CCRE2)
+dev.off()
+```
+
+
+
+### UpSet Plot
+```{r, eval=F}
+all_species <- c("cat", "cow", "horse", "human", "macaque", "marmoset", "mouse", "rabbit", "rat")
+
+# Create a binary matrix indicating presence (1) or absence (0) for each species
+species_matrix <- sapply(all_species, function(sp) {
+  sapply(PEAKS.rd$species, function(x) {
+    as.integer(sp %in% unlist(strsplit(x, "&")))
+  })})
+rownames(species_matrix) <- PEAKS.rd$index
+
+gene_data <- as.data.frame(species_matrix)
+gene_data$CCRE <- PEAKS.rd$CCRE 
+gene_data$linked<-PEAKS.rd$linked
+
+pdf("Num_Species_ATAC-seq_conservedSeq.pdf", width=9, height=5)
+ComplexUpset::upset(gene_data,
+  intersect = all_species,  # Use species columns as sets
+  base_annotations = list(
+    'Intersection size' = intersection_size(counts=FALSE,
+      mapping = aes(fill = CCRE)  # Color bars based on presence of human ortholog
+    ) +       scale_fill_manual(values = c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me33"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen")) +
+      theme(legend.position = "top")
+  ),
+  name = "Species",  width_ratio = 0.2,    height_ratio = 0.5,  n_intersections = 15)
+dev.off()
+
+pdf("Num_Species_snATAC-seq_arelinked?.pdf", width=9, height=5)
+ComplexUpset::upset(gene_data,
+  intersect = all_species,  # Use species columns as sets
+  base_annotations = list(
+    'Intersection size' = intersection_size(counts=FALSE,
+      mapping = aes(fill = linked)  # Color bars based on presence of human ortholog
+    )  +  theme(legend.position = "top")
+  ),  name = "Species",  width_ratio = 0.2,  height_ratio = 0.5,  n_intersections = 15)
+dev.off()
+
+
+
+
+
+
+PEAKS.human<-PEAKS.rd[grepl("human", PEAKS.rd$species),]
+
+species_matrix <- sapply(all_species, function(sp) {
+  sapply(PEAKS.human$species, function(x) {
+    as.integer(sp %in% unlist(strsplit(x, "&")))
+  })})
+rownames(species_matrix) <- PEAKS.human$index
+
+gene_data <- as.data.frame(species_matrix)
+gene_data$CCRE <- PEAKS.human$CCRE 
+gene_data$linked<-PEAKS.human$linked
+
+pdf("Num_Species_ATAC-seq_conservedSeq_human-base.pdf", width=9, height=5)
+ComplexUpset::upset(gene_data,
+  intersect = all_species,  # Use species columns as sets
+  base_annotations = list(
+    'Intersection size' = intersection_size(counts=FALSE,
+      mapping = aes(fill = CCRE)  # Color bars based on presence of human ortholog
+    ) +       scale_fill_manual(values = c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me33"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen")) +
+      theme(legend.position = "top")
+  ),
+  name = "Species",  width_ratio = 0.2,    height_ratio = 0.5,  n_intersections = 15)
+dev.off()
+```
+
+
+
+
+
+
+### TEs
+
+re-overlapping because previous overlaps did not have subclass
+```{r, eval=F}
+tes<-read.table("~/cross_species/external_data/TEs/rmsk.hg38.txt")
+colnames(tes)[c(6,7,8,12)]<-c("seqnames","start","end","TE")
+tes<-GRanges(tes)
+tes$TE<-gsub("?","", tes$TE, fixed=T)
+
+ol<-findOverlaps(tes, PEAKS.rd)
+PEAKS.rd$TE_subclass<-"None"
+PEAKS.rd[subjectHits(ol)]$TE_subclass<-tes[queryHits(ol)]$V13
+PEAKS.rd$rmsk2<-ifelse(PEAKS.rd$rmsk %in% c("LINE","LTR","None","DNA","SINE"), PEAKS.rd$rmsk, "None")
+PEAKS.rd$TE_subclass<-ifelse(PEAKS.rd$rmsk2=="DNA","DNA",PEAKS.rd$TE_subclass)
+PEAKS.rd$TE_subclass<-ifelse(PEAKS.rd$rmsk2=="None","None",PEAKS.rd$TE_subclass)
+
+TE_counts <- as.data.frame(PEAKS.rd) %>%
+  filter(F_mod != "R0") %>%  # filter out R0 if needed
+  group_by(F_mod, rmsk2, TE_subclass) %>%
+  summarise(n = n(), .groups = "drop")
+
+# Step 2. For each TE class (and each F_mod if appropriate), rank the subtypes 
+# and recode those not in the top 3 as "Class_other"
+TE_counts_recode <- TE_counts %>%
+  group_by(F_mod, rmsk2) %>%
+  arrange(desc(n), .by_group = TRUE) %>%
+  mutate(subtype_rank = row_number(),
+         subtype_new = ifelse(subtype_rank <= 3, 
+                              TE_subclass, 
+                              paste0(rmsk2, "_other"))) %>%
+  ungroup()
+
+# (Optional) Step 3. Re-summarize counts so that if multiple subtypes become "other",
+# their counts are summed.
+TE_counts_summarized <- TE_counts_recode %>%
+  group_by(F_mod, rmsk2, subtype_new) %>%
+  summarise(total = sum(n), .groups = "drop")
+
+# Step 4. Create a color mapping so that subtypes for a given TE class follow a theme.
+# For example, here we make up a palette. You’ll probably need to adjust according to 
+# your actual subtype names and the number of colors desired.
+
+# Define color palettes per TE class (adjust with your colors)
+# Note that you can also use functions like scales::alpha or colorRampPalette to generate shades.
+color_map <- c(
+  # SINE: assume you have three SINE subtypes and one "SINE_other"
+  "Alu"         = "#08306B",   # dark blue for the most abundant SINE subtype
+  "MIR"    = "#2171B5",   # second shade of blue
+  "tRNA-RTE"    = "#4292C6",   # third shade of blue
+  "SINE_other"   = "#9ecae1",   # light blue for others
+  
+  # LINE: adjust names according to your actual subtype names:
+  "CR1"         = "#00441B",   # dark green for most abundant LINE subtype
+  "L1"    = "#1B7837", 
+  "L2"    = "#4DAD52",
+  "LINE_other"   = "#1CCB52",
+  
+  # LTR:
+  "ERV1"          = "#4A1486",   # dark purple for the top LTR subtype
+  "ERVL"     = "#6A51A3",
+  "ERVL-MaLR"     = "#807DBA",
+  "LTR_other"    = "#DADAEB",
+  
+  # DNA:
+  "DNA"          = "#R2B701",   # dark red-orange for the primary DNA type
+  "None"         = "grey"
+)
+
+
+# For demonstration, let’s assume that after recoding the factor levels in subtype_new are:
+TE_counts_summarized$subtype_new <- factor(TE_counts_summarized$subtype_new, levels=names(color_map))
+
+# Step 5. Plotting the barplot with ggplot2
+pdf("Number_TEs_bySubType.pdf", width = 8, height = 6)
+ggplot(TE_counts_summarized, aes(x = total, y = rmsk2, fill = subtype_new)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ F_mod, scales = "free") +
+  scale_fill_manual(values = color_map) +
+  theme_classic() +
+  labs(x = "Count", y = "TE class", fill = "Subtype") 
+dev.off()
+```
+
+enrichment
+```{r, eval=F}
+PEAKS_work <- PEAKS.rd %>%
+  mutate(
+    rmsk2 = ifelse(rmsk %in% c("LINE", "LTR", "None", "DNA", "SINE"), rmsk, "None"),
+    TE_subclass = ifelse(rmsk2 == "DNA", "DNA", TE_subclass)
+  ) %>%
+  filter(F_mod != "R0")
+
+# Count occurrences per F_mod, TE class, and TE_subclass.
+TE_counts <- PEAKS_work %>%
+  group_by(F_mod, rmsk2, TE_subclass) %>%
+  summarise(count = n(), .groups = "drop")
+
+# ---- Step 1. Recode Subtypes on the Fly ----
+# For each F_mod and TE class, keep the top 3 subtypes by count.
+# All subtypes ranked beyond the top 3 are recoded as "<TEclass>_other".
+TE_recode <- TE_counts %>%
+  group_by(F_mod, rmsk2) %>%
+  arrange(desc(count), .by_group = TRUE) %>%
+  mutate(subtype_new = ifelse(row_number() <= 3, TE_subclass, paste0(rmsk2, "_other"))) %>%
+  ungroup()
+
+# Because multiple original subtypes may have been combined into the same new label,
+# re-aggregate the counts.
+TE_final <- TE_recode %>%
+  group_by(F_mod, rmsk2, subtype_new) %>%
+  summarise(total_count = sum(count), .groups = "drop")
+
+# ---- Step 2. Create a Table for Enrichment Analysis ----
+# The idea is to compare, for each recoded subtype in a given F_mod,
+# the counts observed in that F_mod versus all other F_mod groups.
+# To do this, we first need:
+#    a) the total number of peaks in each F_mod,
+#    b) the overall total across all F_mod groups,
+#    c) the overall total for each recoded subtype across all F_mod groups.
+group_totals <- TE_final %>%
+  group_by(F_mod) %>%
+  summarise(total_in_group = sum(total_count), .groups = "drop")
+
+overall_total <- sum(TE_final$total_count)
+
+subtype_totals <- TE_final %>%
+  group_by(subtype_new) %>%
+  summarise(total_subtype = sum(total_count), .groups = "drop")
+
+# Join these totals into our TE_final data frame.
+TE_enrich <- TE_final %>%
+  left_join(group_totals, by = "F_mod") %>%
+  left_join(subtype_totals, by = "subtype_new")
+
+# For each row, define the 2x2 contingency table values:
+#   - in_target: count for that subtype in that F_mod (observed in the cell)
+#   - in_non: peaks in that F_mod that are not that subtype
+#   - out_target: count for that subtype in all other F_mod groups
+#   - out_non: peaks in all other F_mod groups that are not that subtype
+TE_enrich <- TE_enrich %>%
+  rowwise() %>%
+  mutate(
+    in_target = total_count,
+    in_non    = total_in_group - total_count,
+    out_target = total_subtype - total_count,
+    out_non   = (overall_total - total_in_group) - (total_subtype - total_count)
+  ) %>%
+  ungroup()
+
+# ---- Step 3. Compute Log2 Fold Enrichment and Chi-squared (Fisher's Exact) Test ----
+# For each row, we construct the 2x2 table and run Fisher's exact test.
+# Then we compute:
+#   - odds_ratio from the test,
+#   - log2 fold enrichment as log2(odds_ratio),
+#   - the 95% confidence interval (converted to log2 space),
+#   - the p-value.
+calc_fisher <- function(in_target, in_non, out_target, out_non) {
+  m <- matrix(c(in_target, in_non, out_target, out_non), nrow = 2, byrow = FALSE)
+  fisher.test(m)
+}
+
+# Now, perform the rowwise mutation using the helper function
+TE_enrich <- TE_enrich %>%
+  rowwise() %>%
+  mutate(
+    test = list(calc_fisher(in_target, in_non, out_target, out_non)),
+    odds_ratio = test$estimate,
+    p_value    = test$p.value,
+    ci_lower   = log2(test$conf.int[1]),
+    ci_upper   = log2(test$conf.int[2]),
+    log2OR     = log2(odds_ratio)
+  ) %>%
+  ungroup()
+
+# Set factor levels so that the colors match.
+TE_enrich$subtype_new <- factor(TE_enrich$subtype_new,
+                                levels = names(color_map))
+TE_enrich$rmsk2<-gsub("DNA","DNA Transposon", TE_enrich$rmsk2)
+# ---- Step 5. Plotting the Results ----
+# This plot shows for each F_mod group the log2 fold enrichment (log2OR) of each recoded subtype.
+# Error bars represent the 95% confidence intervals from the Fisher's test.
+# In addition, significance is annotated by mapping the p-value to symbols:
+#   *** for p < 0.001, ** for p < 0.01, * for p < 0.05, or "ns" for nonsignificant.
+pdf("TE_Enrichment_Log2FC.pdf", width = 10, height = 6)
+ggplot(TE_enrich, aes(x = F_mod, y = log2OR, fill = subtype_new)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                position = position_dodge(width = 0.9),
+                width = 0.2) +
+  facet_wrap(~ rmsk2, scales = "free_y", nrow=2) +
+  scale_fill_manual(values = color_map) +
+  theme_classic() +
+  labs(x = "F_mod", y = "Log2 Fold Enrichment", fill = "Subtype") +
+  geom_text(aes(label = ifelse(p_value < 0.001, "***",
+                         ifelse(p_value < 0.01, "**",
+                         ifelse(p_value < 0.05, "*", "ns")))),
+            position = position_dodge(width = 0.9),
+            vjust = -0.5, size = 3)
+dev.off()
+```
+
+
+
+### phastCons
+
+```{r, eval=F}
+
+phast <- import("~/cross_species/external_data/hg38.phastConsElements470way.bed", which=PEAKS.rd)
+
+
+ol<-findOverlaps(PEAKS.rd,phast)
+df <- data.frame(peak_index = queryHits(ol),
+  score = mcols(phast)$score[subjectHits(ol)])
+
+
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(sum_phast = mean(score, na.rm = TRUE))
+PEAKS.rd$phast_avg<-NA
+PEAKS.rd[res$peak_index]$phast_avg<-res$sum_phast
+
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(sum_phast = sum(score, na.rm = TRUE))
+PEAKS.rd$phast_sum<-NA
+PEAKS.rd[res$peak_index]$phast_sum<-res$sum_phast
+
+
+pdf("PhastCons_SUM_density.pdf", width=10,height=4)
+p1<-ggplot(as.data.frame(PEAKS.rd), aes(x=phast_sum, fill=F_mod))+geom_density(alpha=0.5)+theme_classic()+ggtitle("phastCons sum")+xlim(0,10000)
+p2<-ggplot(as.data.frame(PEAKS.rd), aes(x=phast_avg, fill=F_mod))+geom_density(alpha=0.5)+theme_classic()+ggtitle("phastCons avg")+xlim(200,500)
+p3<-ggplot(as.data.frame(PEAKS.rd), aes(x=phast_max, fill=F_mod))+geom_density(alpha=0.5)+theme_classic()+ggtitle("phastCons max")+xlim(200,1000)
+plot_grid(p1,p2,p3, nrow=1)
+dev.off()
+
+pdf("PhastCons_MAX_density.pdf", width=5,height=4)
+ggplot(as.data.frame(PEAKS.rd), aes(x=phast_max, fill=F_mod))+geom_density(alpha=0.5)+theme_classic()+ggtitle("phastCons max")+xlim(100,1200)
+dev.off()
+```
+
+
+### Loupe et al. overlap
+
+-using the DLPFC union lists. have to go back to unlists if I want to bring in other regions
+```{r, eval=F}
+
+union_files<-as.list(readLines("BrainTF/union_bed/files_unions.txt"))
+m=gsub(".csv","", unlist(union_files))
+m=sapply(strsplit(m, "/"),`[`,8)
+union_list=lapply(union_files,function(x){
+  tmp<-GRanges(read.csv(x))
+ })
+names(union_list)<-m
+
+
+ol<-findOverlaps(PEAKS.rd, union_list[["union_DLPFC_NEUN"]])
+PEAKS.rd$NEUN<-NA
+PEAKS.rd[queryHits(ol)]$NEUN<-union_list[["union_DLPFC_NEUN"]][subjectHits(ol)]$TF
+PEAKS.rd$NEUN_HOT<-"None"
+PEAKS.rd[queryHits(ol)]$NEUN_HOT<-union_list[["union_DLPFC_NEUN"]][subjectHits(ol)]$HOT
+
+ol<-findOverlaps(PEAKS.rd, union_list[["union_DLPFC_NEG"]])
+PEAKS.rd$NEG<-NA
+PEAKS.rd[queryHits(ol)]$NEG<-union_list[["union_DLPFC_NEG"]][subjectHits(ol)]$TF
+PEAKS.rd$NEG_HOT<-"None"
+PEAKS.rd[queryHits(ol)]$NEG_HOT<-union_list[["union_DLPFC_NEG"]][subjectHits(ol)]$HOT
+
+ol<-findOverlaps(PEAKS.rd, union_list[["union_DLPFC_OLIG"]])
+PEAKS.rd$OLIG<-NA
+PEAKS.rd[queryHits(ol)]$OLIG<-union_list[["union_DLPFC_OLIG"]][subjectHits(ol)]$TF
+PEAKS.rd$OLIG_HOT<-"None"
+PEAKS.rd[queryHits(ol)]$OLIG_HOT<-union_list[["union_DLPFC_OLIG"]][subjectHits(ol)]$HOT
+
+ol<-findOverlaps(PEAKS.rd, union_list[["union_DLPFC"]])
+PEAKS.rd$BULK<-NA
+PEAKS.rd[queryHits(ol)]$BULK<-union_list[["union_DLPFC"]][subjectHits(ol)]$TF
+PEAKS.rd$BULK_HOT<-"None"
+PEAKS.rd[queryHits(ol)]$BULK_HOT<-as.character(union_list[["union_DLPFC"]][subjectHits(ol)]$HOT)
+
+```
+
+
+
+
+## Andrews et al. G1/G3
+```{r, eval=F}
+
+
+mat<-as.matrix(table(PEAKS.rd$F_mod, PEAKS.rd$cCRE_class))
+prop<-as.matrix(prop.table(table(PEAKS.rd$F_mod, PEAKS.rd$cCRE_class),1))
+
+
+ra<-rowAnnotation(F_Mod=rownames(mat),
+col=list(F_Mod=c(
+"R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R3"= "#619CFF","R4"= "#F564E3")))
+
+pdf("Heatmap_overlap_Andres2023.pdf",width=5,height=5)
+Heatmap( prop,left_annotation=ra, name="% overlap", col=colorRamp2( c(0,0.15,0.57), plasma(3)), cell_fun = function(j, i, x, y, width, height, fill) {
+                value <- mat[i, j]
+                text_color <- if(value < 15000) "white" else "black"
+                grid.text(sprintf("%.1f", value), x = x, y = y, gp = gpar(col = text_color))
+              }, cluster_rows=F, cluster_columns=F) 
+dev.off()
+
+```
+
+
+
+# Cell type-specificity
+
+
+## liftover
+```{bash, eval=F}
+conda activate ~/miniconda3/envs/CrossMap/
+
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToBosTau9.over.chain.gz PEAKS_forliftover.bed  cow_postliftover.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToCalJac4.over.chain.gz PEAKS_forliftover.bed  marmoset_postliftover.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToEquCab3.over.chain.gz PEAKS_forliftover.bed  horse_postliftover.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToFelCat9.over.chain.gz PEAKS_forliftover.bed  cat_postliftover.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToOryCun2.over.chain.gz PEAKS_forliftover.bed  rabbit_postliftover.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToRn7.over.chain.gz PEAKS_forliftover.bed      rat_postliftover.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToMm10.over.chain.gz PEAKS_forliftover.bed     mouse_postliftover_try2.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToOryCun2.over.chain.gz PEAKS_forliftover.bed rabbit_postliftover.bed"
+sbatch -n 10 --mem=50G --wrap="CrossMap.py region -r 0.25 cross_species/LIFTOVER_chains/hg38ToRheMac10.over.chain.gz PEAKS_forliftover.bed  macaque_postliftover.bed"
+
+```
+
+## pseudobulk 
+
+```{r, eval=F}
+
+library(Seurat)
+library(Signac)
+library(dplyr)
+library(rtracklayer)
+
+args = commandArgs(trailingOnly=TRUE)
+species="mouse"
+
+
+data<-readRDS(paste0("~/cross_species/scAnalysis/",species2,"/seurat.rds"))
+DefaultAssay(data)<-"ATAC"
+gr<-granges(data)
+peaks<-read.table(paste0("~/cross_species/PEAKS/PB_resize1kb_bin2kb/",species,"_postliftover_try2.bed"))
+colnames(peaks)<-c("seqnames","start","end","width","strand","index","map")
+bin<-ifelse(sum(grepl("chr",peaks$seqnames))>0 & sum(grepl("chr", seqnames(gr)))==0, "replace","don't")
+if(bin=="replace"){
+  peaks$seqnames<-gsub("chr","", peaks$seqnames)}
+
+
+peaks<-GRanges(peaks)
+peaks$peak<-paste0(seqnames(peaks),"-",start(peaks),"-",end(peaks))
+peaks<-peaks[width(peaks)<10000,]
+
+macs2_counts<-FeatureMatrix(fragments=Fragments(data), features=peaks,cells=colnames(data))
+data[["PEAKS"]]<-CreateChromatinAssay(counts=macs2_counts,  fragments=Fragments(data))
+Idents(data)<-data$cluster_celltype
+
+
+
+mat<-as.data.frame(AggregateExpression(data, assay="PEAKS")$PEAKS)
+colnames(mat)<-paste0(species,".", colnames(mat))
+mat$peak<-rownames(mat)
+mat<-merge(mat,mcols(peaks), by="peak")
+mat$map<-as.numeric(sapply(strsplit(mat$map,"="),`[`,2))
+
+write.csv(mat,paste0("~/cross_species/PEAKS/PB_resize1kb_bin2kb/celltype_pseudobulk-accessibility_",species,".csv"),row.names=F)
+
+
+```
+
+
+## Merge
+
+This is just bringing in the pseudobulk counts for each celltype
+```{r, eval=F}
+files<-as.list(readLines("cross_species/PEAKS/PB_resize1kb_bin2kb/path_to_pb_PEAKS.txt"))
+
+PB<-lapply(files, function(x){
+  tmp<-read.csv(x)
+  tmp<-tmp[,which(colnames(tmp) != "peak")]
+  if( "map" %in% colnames(tmp)){
+    a<-sapply(strsplit(colnames(tmp)[1], ".", fixed=T),`[`,1)
+    colnames(tmp)[10]<-paste0(a,".map")}
+  else{
+    tmp<-tmp[,-c(9,10,11,12,13)]
+  }
+  return(tmp)
+})
+
+#merge all files by index
+merged_df <- Reduce(function(x, y) merge(x, y, by = "index", all = TRUE), PB)
+rownames(merged_df)<-merged_df[,1]
+merged.mat<-as.matrix(merged_df[,-1])
+
+#remove peaks that can't liftover to all species
+merged.complete<-merged.mat[complete.cases(merged.mat),]
+
+write.csv(merged.mat, "~/cross_species/PEAKS/Pseudobulk_CellType-Species_ATAC-seq_matrix.csv")
+```
+
+
+
+## UMAP
+
+```{r, eval=F}
+seurat<-CreateSeuratObject(merged.complete[,!(grepl("map",colnames(merged.complete)))])
+meta<-data.frame(BC=colnames(merged.complete))
+meta$species<-sapply(strsplit(meta[,1],".", fixed=T),`[`,1)
+meta$ct<-sapply(strsplit(meta[,1],".", fixed=T),`[`,2)
+rownames(meta)<-meta$BC
+seurat<-AddMetaData(seurat, meta)
+
+
+seurat<-NormalizeData(seurat)
+seurat<-ScaleData(seurat)
+seurat<-FindVariableFeatures(seurat, nfeatures=100000)
+top10 <- head(VariableFeatures(seurat), 10)
+
+# Plot accessibility by variance
+hvf.info <- HVFInfo(object = seurat  )
+hvf.info$index<-rownames(hvf.info)
+hvf.info<-merge(hvf.info, PEAKS.rd, by="index")
+
+
+# Go back to PB-profiles
+seurat<-RunPCA(seurat, features=hvf.info[which(hvf.info$variance.standardized>0.8),]$index)
+seurat<-RunUMAP(seurat, dims=1:8)
+
+pdf("UMAP_PB-profiles.pdf", width=12, height=7)
+#ElbowPlot(seurat)
+p1<-DimPlot(seurat, group.by="species", pt.size=3,cols= c(
+  # Primates (all in a blue family)
+  "human"    = "dodgerblue3",  
+  "macaque"  = "#66A9D1",  
+  "marmoset" = "#A1C6EA",  
+  
+  # Rodents (vibrant greens)
+  "mouse"    = "#009E73", 
+  "rat"      = "#66C2A5", 
+    # Other mammals (vibrant oranges)
+  "cat"      = "#D95R02",  
+  "cow"      = "#R2B701",  
+  "horse"    = "#R46D43",  
+  "rabbit"   = "olivedrab3"   
+))+theme(legend.position="top")
+p2<-DimPlot(seurat, group.by="ct",pt.size=3,cols=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1"))+theme(legend.position="top")
+p1+p2
+dev.off()
+
+```
+
+
+## Tau Specificity Index
+
+Using same tau metric. Calculate specificity for all peaks.
+To do this,
+-substitute all NAs (non-lifted over regions) with 0 for cpm normalization
+- change these values back to NA so that it doesn't get weighed in the specificity metric (because no signal is different than no sequence)
+- average accessibility across species (not weighing NAs)
+- calculate tau score for each peak
+- classify peaks:
+  - cell type-specific: tau score >0.7 and FC > 1.5
+  - neuronal: tau > 0.5 and top 2 cell types are neuronal
+  - shared: else
+  
+```{r, eval=F}
+ merged.mat<-read.csv("~/cross_species/PEAKS/Pseudobulk_CellType-Species_ATAC-seq_matrix.csv")
+PEAKS.rd<-readRDS("~/cross_species/PEAKS/CONSENSUS_PEAKS_resize1kb_bin2kb_F-correction_wPhastCons.rds")
+
+#normalize with NAs as 0 but return to NA to not bias specificity [,!(grepl("map", colnames(merged.complete))) ]
+merged.mat.incomplete<-merged.mat[,!(grepl("map", colnames(merged.mat)))]
+merged.mat.incomplete[is.na(merged.mat.incomplete)]<-0
+merged.mat.incomplete<-cpm(merged.mat.incomplete)
+merged.mat.incomplete[is.na(merged.mat[,!(grepl("map", colnames(merged.mat)))])]<-NA
+
+
+meta<-as.data.frame(colnames(merged.mat.incomplete))
+meta$ct<-sapply(strsplit(meta[,1],".", fixed=T),`[`,2)
+
+PB.df<-as.data.frame(merged.mat.incomplete[,!(meta$ct %in% c("Pericytes","Endothelial"))])
+PB.df$peak_id<-rownames(PB.df)
+PB.m<-melt(PB.df)
+PB.m$species<-sapply(strsplit(  as.character(PB.m$variable),".", fixed=T),`[`,1)
+PB.m$cell_type<-sapply(strsplit(as.character(PB.m$variable),".", fixed=T),`[`,2)
+colnames(PB.m)[3]<-"CPM"
+PB.m<-PB.m[,-2]
+
+
+#########################################
+# cell type specificity (tau)
+
+
+# Compute mean CPM across all non‑human species for each peak × cell type
+peak_ct <- PB.m %>%
+  group_by(peak_id, cell_type) %>%
+  summarise(mean_CPM = mean(CPM, na.rm=TRUE), .groups="drop")
+
+# Wide matrix: rows=peak, cols=cell types
+peak_mat <- tidyr::pivot_wider(peak_ct, names_from=cell_type, values_from=mean_CPM, values_fill=0)
+ct_names <- colnames(peak_mat)[-c(1,8)]
+
+# Tau = sum(1 – (x_i/max(x))) / (n-1)
+tau <- apply(peak_mat[,ct_names], 1, function(x) {
+  if(max(x)==0) return(NA)
+  sum(1 - x/max(x))/(length(x)-1)
+})
+peak_mat$tau <- tau
+
+
+
+#tau specificity option
+peak_mat$specificity_ct <- apply(peak_mat, 1, function(row) {
+  # Extract the cell type values and tau from the row.
+  # Note: row[ct_names] selects the columns corresponding to cell types.
+  x <- as.numeric(row[ct_names])
+  tau_val <- as.numeric(row["tau"])
+  
+  # Order the cell type values (largest to smallest) and get the indices.
+  ord <- order(x, decreasing = TRUE)
+  
+  # First condition: top fold change is >=1.5 and tau > 0.7
+  if (tau_val > 0.7 && (x[ord[1]] / (x[ord[2]] + 1e-6)) >= 1.5) {
+    return(ct_names[ord[1]])
+  } 
+  # Second condition: top two are Excitatory and Inhibitory and tau > 0.5.
+  else if (tau_val > 0.5 && all(ct_names[ord[1:2]] %in% c("Excitatory", "Inhibitory"))) {
+    return("Neuronal")
+  } 
+  else {
+    return("Shared")
+  }
+})
+
+
+PEAKS.rd<-GRanges(merge(PEAKS.rd[,-c(27,28,29)], peak_mat[,c(1,9,10,11)], by.x="index",by.y="peak_id", all.x=T))
+
+
+
+```
+  
+  
+
+  
+  
+  
+  
+### Heatmap
+```{r, eval=F}
+merged.mat<-read.csv("~/cross_species/PEAKS/Pseudobulk_CellType-Species_ATAC-seq_matrix.csv")
+merged.mat<-merged.mat[,-1]
+
+
+# Do CPM(counts+1) where 0 counts indicates inability to liftover to genome
+merged.map<-merged.mat[,(grepl("map", colnames(merged.mat)))]
+merged.map[is.na(merged.map)]<-0.25
+merged.mat.incomplete<-merged.mat[,!(grepl("map", colnames(merged.mat)))]
+merged.mat.incomplete<-merged.mat.incomplete+1
+merged.mat.incomplete[is.na(merged.mat.incomplete)]<-0
+merged.mat.incomplete<-cpm(merged.mat.incomplete)
+
+
+
+meta<-as.data.frame(colnames(merged.mat.incomplete))
+meta$ct<-sapply(strsplit(meta[,1],".", fixed=T),`[`,2)
+
+PB.mat<-merged.mat.incomplete[,!(meta$ct %in% c("Pericytes","Endothelial"))]
+rownames(PB.mat)<-as.character(seq(1,nrow(PB.mat)))
+
+
+###########################################
+# downsample to only 10k peaks
+names(PEAKS.rd)<-PEAKS.rd$index
+keep<-sample(PEAKS.rd$index, 15000,replace=F)
+
+keep.mat<-PB.mat[keep,]
+PEAKS.keep<-PEAKS.rd[keep,]
+map.keep<-merged.map[keep,]
+
+
+meta<-as.data.frame(colnames(keep.mat))
+meta$ct<-sapply(strsplit(meta[,1],".", fixed=T),`[`,2)
+meta$species<-sapply(strsplit(meta[,1],".", fixed=T),`[`,1)
+
+###########################################
+
+ha<-HeatmapAnnotation(celltype=meta$ct, species=meta$species, 
+                   col=list(celltype=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1"), 
+        species=c(
+  # Primates (all in a blue family)
+  "human"    = "darkorchid4",  
+  "macaque"  = "#66A9D1",  
+  "marmoset" = "#A1C6EA",  
+  # Rodents (vibrant greens)
+  "mouse"    = "#009E73", 
+  "rat"      = "#66C2A5", 
+    # Other mammals (vibrant oranges)
+  "cat"      = "#D95R02",  
+  "cow"      = "#R2B701",  
+  "horse"    = "#R46D43",  
+  "rabbit"   = "#FEE08B"   
+)
+))
+
+ra<-rowAnnotation(celltype=PEAKS.keep$specificity_ct, CRE=PEAKS.keep$CCRE, col=list(celltype=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3",
+           "OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60",
+           "Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1", "Shared"="grey20","Neuronal"="blue"), CRE=c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me3"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen","None"="grey")))
+
+h1=Heatmap(keep.mat, name="Normalized Accessiblity", col=colorRamp2(c(0,0.001,0.4,2,3,6), c("black", "black", viridis(4))), cluster_rows=T, cluster_row_slices = F,cluster_columns=F,use_raster=T, show_row_names=F, show_row_dend = FALSE, top_annotation=ha, right_annotation=ra, row_split=PEAKS.keep$specificity_ct, column_split=meta$ct)
+
+
+# MAPPING
+meta2<-as.data.frame(colnames(map.keep))
+meta2$species<-sapply(strsplit(meta2[,1],".", fixed=T),`[`,1)
+colnames(meta2)[1]<-"name"
+
+ha2<-HeatmapAnnotation(species=meta2$species, 
+                   col=list(species=c(
+  # Primates (all in a blue family)
+  "human"    = "darkorchid4",  
+  "macaque"  = "#66A9D1",  
+  "marmoset" = "#A1C6EA",  
+  
+  # Rodents (vibrant greens)
+  "mouse"    = "#009E73", 
+  "rat"      = "#66C2A5", 
+    # Other mammals (vibrant oranges)
+  "cat"      = "#D95R02",  
+  "cow"      = "#R2B701",  
+  "horse"    = "#R46D43",  
+  "rabbit"   = "#FEE08B"   
+)
+))
+
+h2=Heatmap(map.keep, name="Map Ratio", col=colorRamp2(c(0.25,0.85,1), c("blue","white","red")), cluster_rows=F, use_raster=T, show_row_names=F, show_row_dend = FALSE, top_annotation=ha2, row_split=PEAKS.keep$specificity_ct)
+
+
+pdf("Cross_species_pseudobulk_access-HEATMAP_wMAPPING-SCORE_celltype_REDO.pdf", width=10,height=8)
+h1+h2
+dev.off()
+
+```
+
+
+
+### Enrichment
+```{r, eval=F}
+library(dplyr)
+library(tidyr)
+library(broom)
+library(ggplot2)
+library(forcats)
+
+peaks_df<-as.data.frame(PEAKS.rd)
+peaks_df<-peaks_df[is.na(peaks_df$specificity_ct )==F & peaks_df$F_mod!="R0",]
+
+results <- list()
+for (fmod in unique(peaks_df$F_mod)) {
+  # Mark whether the peak is in the current conservation level
+  peaks_df <- peaks_df %>%
+    mutate(is_fmod = F_mod == fmod)
+  
+  # Loop through each cell type
+  for (ct in unique(peaks_df$specificity_ct)[-9]) {
+    # Create a 2x2 table
+    peaks_df <- peaks_df %>%
+    mutate(is_ct = specificity_ct == ct)
+    table <- table(peaks_df$is_fmod, peaks_df$is_ct)
+    
+    if (all(dim(table) == c(2,2))) {
+      fisher <- fisher.test(table)
+      or <- fisher$estimate
+      ci <- fisher$conf.int
+      
+      results[[length(results)+1]] <- tibble(
+        F_mod = fmod,
+        cell_type = ct,
+        odds_ratio = or,
+        log2_or = log2(or),
+        ci_lower = log2(ci[1]),
+        ci_upper = log2(ci[2]),
+        p_value = fisher$p.value
+      )
+    }
+  }
+}
+
+# Combine all results
+enrich_df <- bind_rows(results)
+
+# Plot
+enrich_df <- enrich_df %>%
+  mutate(
+    F_mod = gsub("F", "R", F_mod),
+    p_adj = p.adjust(p_value, method = "BH"),
+    sig = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      TRUE          ~ ""))
+enrich_df <- enrich_df %>%
+  mutate(label_y = ifelse(log2_or > 0, ci_upper + 0.2, ci_lower - 0.2))
+
+pdf("CellType_Enrichments_By-RegCons.pdf", width = 8, height = 3)
+ggplot(enrich_df, aes(y = log2_or, x = cell_type, fill = cell_type)) +
+  geom_col(position = position_dodge(width = 0.8), aes(group = cell_type)) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                position = position_dodge(width = 0.8), width = 0.25) +
+  geom_text(aes(label = sig, y = label_y), 
+            position = position_dodge(width = 0.8), 
+            vjust = ifelse(enrich_df$log2_or > 0, 0, 1), 
+            size = 3.5) +
+  facet_wrap(~F_mod, nrow = 1, scales="free_x") +
+  labs(y = "log2(Odds Ratio)", x = "Regulatory conservation", fill = "Cell Type") +
+  theme_classic() +
+  scale_fill_manual(values = c(
+    "Oligodendrocytes" = "coral3",
+    "Excitatory" = "cornflowerblue",
+    "Inhibitory" = "seagreen3",
+    "OPCs" = "firebrick",
+    "Microglia" = "mediumorchid3",
+    "Endothelial" = "grey60",
+    "Pericytes" = "lightpink",
+    "Astrocytes" = "darkgoldenrod1",
+    "Shared" = "grey20",
+    "Neuronal" = "blue"
+  )) +
+  theme(legend.position = "none")
+
+dev.off()
+
+
+```
+
+
+
+# Sequence conservation
+
+Can define sequence conservation using the psedobulk profile because lifting over every peak
+```{r, eval=F}
+#PEAKS.rd$S_humanSpec<- !(PEAKS.rd$index %in% rownames(merged.complete))
+
+
+merged.map<-merged.mat[,(grepl("map",colnames(merged.mat))) ]
+merged.map2<-merged.map
+merged.map2[is.na(merged.map2)]<-0.1
+map_df<-as.data.frame(merged.map2)
+
+
+
+
+# Example: Assume 'map_df' is a data frame where each row is a peak,
+# and columns are the liftover mapping ratios for each species:
+# Columns: "cat.map", "cow.map", "horse.map", "macaque.map", "marmoset.map", 
+#          "mouse.map", "rabbit.map", "rat.map"
+
+# For clarity, here are the species groups:
+primate_cols <- c("macaque.map", "marmoset.map")
+nonprimate_cols <- c("cat.map", "cow.map", "horse.map", "mouse.map", "rabbit.map", "rat.map")
+
+# S1: Human-specific: if all mapping ratios are below 0.25, assign S1.
+is_S1 <- apply(map_df, 1, function(x) all(x < 0.25))
+
+# Calculate average mapping ratio for primate and non-primate groups.
+primate_avg <- rowMeans(map_df[, primate_cols])
+nonprimate_avg <- rowMeans(map_df[, nonprimate_cols])
+
+primate_max <- apply(map_df[, primate_cols],1, max)
+nonprimate_max <- apply(map_df[, nonprimate_cols],1,  max)
+
+# Initialize the classification vector.
+S_class <- rep(NA, nrow(map_df))
+S_class[is_S1] <- "S1"  # Human-specific
+
+# For peaks that are not S1, assign based on thresholds.
+# These thresholds are heuristic and can be adjusted based on your data.
+for (i in which(!is_S1)) {
+  
+  # Ultra-conserved: high mapping across both primate and non-primate species.
+  if (primate_avg[i] > 0.9 & nonprimate_avg[i] > 0.9) {
+    S_class[i] <- "S4"  # Ultra-conserved
+  
+  # Primate-specific: good mapping in primates but poor mapping in non-primates.
+  } else if (primate_max[i] > 0.25 & nonprimate_max[i] < 0.25) {
+    S_class[i] <- "S2"  # Primate-specific
+  
+  # Mammal-conserved: reasonable mapping in non-primates and primates.
+  } else if (nonprimate_max[i] > 0.25 & primate_max[i] > 0.25) {
+    S_class[i] <- "S3"  # Mammal-conserved
+  
+  # Optionally, you can classify the remaining cases as unclassified or assign them to a category.
+  } else {
+    S_class[i] <- "Variable"
+  }
+}
+
+map_df$S_class <- S_class
+table(map_df$S_class)
+
+
+df<-data.frame(index=rownames(map_df), S_name=map_df$S_class)
+PEAKS.rd<-GRanges(merge(PEAKS.rd, df, all.x=T))
+
+PEAKS.rd$S_name<-ifelse(PEAKS.rd$S_name=="S1" & PEAKS.rd$F_level!="R1" , paste0("S",ceiling(PEAKS.rd$F_level)), PEAKS.rd$S_name)
+PEAKS.rd$S_name<-ifelse(PEAKS.rd$S_name=="S0", "S3", PEAKS.rd$S_name)
+#saveRDS(PEAKS.rd, "~/cross_species/PEAKS/CONSENSUS_w_S-name.rds")
+
+
+tab<-table(PEAKS.rd$S_name, PEAKS.rd$F_name)[,]
+pdf("S-class_F-class.pdf", width=7,height=5)
+Heatmap( log10(tab+1), name="log10(Num Peaks)", col=colorRamp2( c(0,3,5), plasma(3)), cell_fun = function(j, i, x, y, width, height, fill) {
+                value <- tab[i, j]
+                text_color <- if(value < 1000) "white" else "black"
+                grid.text(sprintf("%.1f", value), x = x, y = y, gp = gpar(col = text_color))
+              }, cluster_rows=F, cluster_columns=F) 
+dev.off()
+
+
+
+
+```
+
+
+# Target Conservation
+
+## Summary
+```{r, eval=F}
+# number of conserved links
+tab<-as.data.frame(table(LINKS$combined))
+tab$Function<-sapply(strsplit(as.character(tab$Var1),"-", fixed=T),`[`,1)
+tab$Target<-sapply(strsplit(as.character(tab$Var1),"-", fixed=T),`[`,2)
+tab$Var1<-factor(tab$Var1, levels=rev(c(unique(tab$Var1)[-1],tab$Var1[1])))
+pdf("Num_links_by_category_REDO.pdf", width=4,height=7)
+ggplot(tab[which(tab$Var1!="outlier"),], aes(y=Var1, x=log10(Freq), fill=Function))+geom_bar(stat="identity")+theme_classic()+theme(legend.position="none")+ylab("Degree of link conservation")+xlab("log10(Num Links)")
+dev.off()
+
+
+tab<-as.data.frame(prop.table(table(LINKS$combined, LINKS$CCRE),1))
+tab$Function<-sapply(strsplit(as.character(tab$Var1),"-", fixed=T),`[`,1)
+tab$Target<-sapply(strsplit(as.character(tab$Var1),"-", fixed=T),`[`,2)
+tab$Var1<-factor(tab$Var1, levels=rev(c(unique(tab$Var1)[-1],tab$Var1[1])))
+pdf("Num_links_by_category_wCRE_REDO.pdf", width=3,height=7)
+ggplot(tab[!(tab$Var1 %in% c("outlier")),], aes(y=Var1, x=Freq, fill=Var2))+geom_bar(stat="identity")+theme_classic()+theme(legend.position="none")+ylab("Degree of link conservation")+xlab("log10(Num Links)")+scale_fill_manual(values=c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me3"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen","None"="grey"))
+dev.off()
+
+
+
+
+```
+
+
+
+
+## Dist TSS
+
+
+```{r, eval=F}
+LINKS2<-LINKS
+LINKS2$CCRE2<-ifelse(LINKS2$CCRE %in% c("PLS","pELS"),"PLS",
+                     ifelse(LINKS2$CCRE=="None","None", "ELS"))
+
+
+df<-mcols(LINKS2[which(LINKS2$T_name!="T0"),])
+
+pdf("DistTSS_byT-class_REDO.pdf", width=5,height=4)
+ggplot(df, aes(x=as.numeric(dist),y=T_mod, fill=T_mod))+geom_boxplot()+theme_classic()+xlab("Dist TSS (hg38)")+scale_fill_manual(values=c(
+"T0"= "#F8766D","T1"= "#B79R00","T2"= "#00BA38","T3"= "#619CFF","T4"= "#F564E3")
+)
+dev.off()
+
+
+pdf("DistTSS_byT-class_byCRE_REDO.pdf", width=5,height=4)
+ggplot(df, aes(x=as.numeric(dist),y=T_mod, fill=CCRE2))+geom_boxplot()+theme_classic()+xlab("Dist TSS (hg38)")+scale_fill_manual(values=c("PLS"= "red","ELS"="gold","None"="grey"))
+dev.off()
+
+
+```
+
+
+
+## phyloP vs RVIS
+```{r, eval=F}
+
+# caveat being that many links don't have RVIS and many peaks don't have phyloP. 
+# The phyloP is also average? for ENCODE CRE
+pdf("Cor_MEANphyloP_RVIS.pdf")
+ggplot(as.data.frame(LINKS2), aes(x=as.numeric(mean_phyloP), y=Residual.Variation.Intolerance.Score.Percentile, color=F_name))+geom_smooth(method="lm", fullrange=T)+stat_cor()+theme_classic()
+ggplot(as.data.frame(LINKS2), aes(x=as.numeric(mean_phyloP), y=Residual.Variation.Intolerance.Score.Percentile, color=T_name))+geom_smooth(method="lm", fullrange=T)+stat_cor()+theme_classic()
+ggplot(as.data.frame(LINKS2[which(LINKS2$T_name!="T0"),]), aes(x=as.numeric(mean_phyloP), y=Residual.Variation.Intolerance.Score.Percentile, color=T_name))+geom_smooth(method="lm", fullrange=T, se=F)+stat_cor()+theme_classic()+facet_wrap(~CCRE2)+ylim(0,100)
+dev.off()
+
+
+
+df<-as.data.frame(LINKS2)
+df$phyloP_trans<-transform_signed_log(df$mean_phyloP) #sign log(1+abs(phyloP))
+
+library(ggdensity)
+pdf("Cor_MEANphyloP_RVIS_density.pdf", width=8,height=8)
+ggplot(as.data.frame(df[which(df$T_name!="T0" & df$CCRE %in% c("dELS","PLS", "None", "pELS")),]), aes(x=phyloP_trans, y=Residual.Variation.Intolerance.Score.Percentile, fill=T_name, color=T_name))+theme_classic()+facet_grid(T_name~CCRE2)+ylim(0,100) +geom_hdr() +stat_cor(color="darkblue")+geom_smooth(method="lm", fullrange=T, se=F, color="darkblue")+scale_color_manual(values=c(
+"T1"= "#B79R00","T2"= "#00BA38","T2.5"= "#00BFC4","T3"= "#619CFF","T4"= "#F564E3"))+scale_fill_manual(values=c(
+"T1"= "#B79R00","T2"= "#00BA38","T2.5"= "#00BFC4","T3"= "#619CFF","T4"= "#F564E3"))
+dev.off()
+
+
+
+pdf("PhyloP_and_RVIS_boxplots.pdf", width=8,height=5)
+ggplot(df, aes(x=T_name, fill=T_name, y=phyloP_trans))+geom_boxplot()+theme_classic()
+ggplot(df, aes(x=T_name, fill=T_name, y=Residual.Variation.Intolerance.Score.Percentile))+geom_boxplot()+theme_classic()
+dev.off()
+
+
+```
+
+
+## PhastCons vs RVIS
+
+this version is just using the score from the annotated cons element
+```{r, eval=F}
+peaks.import<-keepStandardChromosomes(PEAKS.rd, pruning.mode="coarse")
+phast <- import("~/cross_species/external_data/hg38.phastConsElements470way.bed", which=peaks.import)
+
+
+ol<-findOverlaps(LINKS,phast)
+df <- data.frame(peak_index = queryHits(ol),
+  score = mcols(phast)$score[subjectHits(ol)])
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(max_phast = max(score, na.rm = TRUE), sum_phast=sum(score)
+  )
+LINKS$phast_max<-NA
+LINKS[res$peak_index]$phast_max<-res$max_phast
+LINKS$phast_sum<-NA
+LINKS[res$peak_index]$phast_sum<-res$sum_phast
+
+
+LINKS2<-LINKS
+LINKS2$CCRE2<-ifelse(LINKS2$CCRE %in% c("PLS"), "PLS",
+                     ifelse(LINKS2$CCRE!="None","ELS", "None"))
+LINKS2$RVIS<-100-LINKS2$Residual.Variation.Intolerance.Score.Percentile
+pdf("Cor_phastCons_RVIS_density_t-mod_REDO.pdf", width=5,height=5)
+ggplot(as.data.frame(LINKS2[which(LINKS2$CCRE2!="None"),]), aes(x=as.numeric(phast_sum), y=RVIS, color=T_mod))+geom_smooth(method="lm", fullrange=T, se=F)+stat_cor(method="spearman")+theme_classic()+facet_wrap(~CCRE2)+ylim(0,100)
+dev.off()
+
+
+pdf("Cor_phastCons_RVIS_density_t-mod_REDO_noCRE-split.pdf", width=5,height=5)
+ggplot(as.data.frame(LINKS2[which(LINKS2$CCRE2!="None"),]), aes(x=as.numeric(phast_sum), y=RVIS, color=T_mod))+geom_smooth(method="lm", fullrange=T, se=F)+stat_cor(method="spearman")+theme_classic()+ylim(0,100)
+dev.off()
+
+
+
+pdf("Cor_phyloP_RVIS_density.pdf", width=5,height=5)
+ggplot(as.data.frame(LINKS2[which(LINKS2$CCRE2!="None"),]), aes(x=as.numeric(mean_phyloP), y=Residual.Variation.Intolerance.Score.Percentile, color=T_name))+geom_smooth(method="lm", fullrange=T, se=F)+stat_cor()+theme_classic()+facet_wrap(~CCRE2)
+dev.off()
+
+```
+
+
+### sig more correlated
+```{r, eval=F}
+df<-as.data.frame(LINKS2)
+
+model <- lm(Residual.Variation.Intolerance.Score ~ phast_max * T_name +CCRE2, data = df)
+
+# for max element
+df$T_name<-factor(df$T_name)
+df$T_name <- relevel(df$T_name, ref = "T4")
+model_T4ref <- lm(Residual.Variation.Intolerance.Score.Percentile ~ phast_max * T_name +CCRE2, data = df)
+summary(model_T4ref)
+
+
+
+
+
+coef_df <- as.data.frame(coef(summary(model_T4ref)))
+coef_df$Term <- rownames(coef_df)
+
+# Get the slope for T4
+slope_T4 <- coef_df$Estimate[coef_df$Term == "phast_max"]
+se_T4 <- coef_df$`Std. Error`[coef_df$Term == "phast_max"]
+
+# Create a data frame for slopes per T category and add the p-values
+slope_data <- data.frame(
+  T_category = levels(df$T_name),
+  Slope = NA,
+  Lower = NA,
+  Upper = NA,
+  p_value = NA
+)
+
+for(cat in levels(df$T_name)) {
+  if(cat == "T4") {
+    est <- slope_T4
+    se <- se_T4
+    pval <- NA  # no comparison for reference group
+  } else {
+    interaction_term <- paste0("phast_max:T_name", cat)
+    # The slope for the category is the sum of the T4 slope and the interaction term coefficient.
+    est <- slope_T4 + coef_df$Estimate[coef_df$Term == interaction_term]
+    se1 <- se_T4
+    se2 <- coef_df$`Std. Error`[coef_df$Term == interaction_term]
+    # A rough approximation of the standard error of the sum (ignoring covariance):
+    se <- sqrt(se1^2 + se2^2)
+    # The p-value for the difference from T4 is in the interaction term.
+    pval <- coef_df$`Pr(>|t|)`[coef_df$Term == interaction_term]
+  }
+  slope_data[slope_data$T_category == cat, "Slope"] <- est
+  slope_data[slope_data$T_category == cat, "Lower"] <- est - 1.96 * se
+  slope_data[slope_data$T_category == cat, "Upper"] <- est + 1.96 * se
+  slope_data[slope_data$T_category == cat, "p_value"] <- pval
+}
+
+# Create the forest plot
+p <- ggplot(slope_data, aes(x = T_category, y = Slope)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(x = "T Category", y = "Slope (Effect of phast_max on RVIS)",
+       title = "Differences in Slopes of phast_max Predicting RVIS") +
+  theme_classic()
+
+# Annotate p-values for non-reference groups
+p <- p + geom_text(
+  data = subset(slope_data, !is.na(p_value)),
+  aes(label = paste0("p=", signif(p_value, 2))),
+  nudge_x = 0.25, nudge_y = 0,
+  size = 3,
+  color = "black"
+)
+
+
+# Plot the slopes as a forest plot
+# Create the scatter plot with model lines
+pdf("Predict_RVIS_from_model_REDO.pdf", width=4,height=3)
+ggplot(slope_data, aes(x = T_category, y = Slope)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  labs(x = "T Category", y = "Beta (Effect of phastCons on RVIS)") +
+  theme_classic()
+dev.off()
+
+```
+
+
+## ABC Calls
+```{r, eval=F}
+abc<-read.table("~/cross_species/external_data/Zemke_Supp31_ABC_calls.tsv", header=T)
+abc.gr<-StringToGRanges(abc$hg38_coord,sep = c("-", "-"))
+mcols(abc.gr)<-abc[,c(3,4,54,55)]
+abc.gr$gene<-abc.gr$abc_target_gene
+
+hits <- findOverlaps(LINKS, abc.gr, maxgap = 250)
+abc.gr$index<-0
+abc.gr[subjectHits(hits)]$index<-LINKS[queryHits(hits)]$index
+abc.gr$link<-paste0(abc.gr$index,"_", abc.gr$gene)
+
+ sum(abc.gr$link %in% LINKS[which( LINKS$F_level>0),]$link) #59886
+ sum(abc.gr$link %in% LINKS[which( LINKS$T_level>0),]$link) #28747
+sum(abc.gr$link %in% LINKS[which( LINKS$T_level>0),]$link)/length(LINKS[which( LINKS$T_level>0),]) #37.8%
+
+prop.table(table(LINKS[which(LINKS$index %in% abc.gr$index),]$CCRE2))
+prop.table(table(LINKS[which(LINKS$link %in% abc.gr$link),]$CCRE2))
+
+
+
+
+testing<-LINKS[which( LINKS$T_level>0),]
+testing$ABC<-testing$link %in% abc.gr$link
+testing$CTspec<-testing$specificity_ct %in% "Shared"
+fisher.test(table(testing$CTspec, testing$ABC))
+
+
+```
+
+
+
+## UMAP: links to genes by class
+```{r, eval=F}
+LINKS$GROUP<-paste0(LINKS$specificity_ct, "-", LINKS$T_mod)
+
+mat<-table(LINKS$gene, LINKS$T_mod)
+mat2<-table(LINKS$gene, LINKS$GROUP)
+mat2<-mat2[rowSums(mat[,-1])>0,!grepl("T0", colnames(mat2))]
+mat2.pca<-prcomp(mat2)
+
+
+pca_df<-as.data.frame(mat2.pca$x[,1:10])
+pca_df$gene<-rownames(pca_df)
+pdf("PCA_Link-genes_type_link.pdf")
+ggplot(pca_df, aes(x=PC3, y=PC2))+geom_point()+theme_classic()+geom_text_repel(aes(label=gene))
+dev.off()
+
+
+
+
+
+
+
+
+library(uwot)
+set.seed(123)
+
+LINKS$GROUP<-paste0(LINKS$specificity_ct, "-", LINKS$T_mod)
+mat2<-table(LINKS$gene, LINKS$GROUP)
+mat2<-mat2[rowSums(mat[,-1])>0,!grepl("T0", colnames(mat2))]
+
+mat2_numeric <- as.matrix(mat2)
+storage.mode(mat2_numeric) <- "numeric"
+umap_coords <- uwot::umap(mat2_numeric, n_neighbors = 15)
+umap_df <- as.data.frame(umap_coords)
+umap_df$gene <- rownames(mat2)
+
+mat2_df <- as.data.frame.matrix(mat2)
+mat2_numeric <- as.matrix(mat2_df)
+storage.mode(mat2_numeric) <- "numeric"
+
+# run UMAP
+umap_coords <- uwot::umap(mat2_numeric, n_neighbors = 15)
+umap_df <- as.data.frame(umap_coords)
+umap_df$gene <- rownames(mat2_numeric)
+
+
+# Step 2: Calculate proportion of links that are "Shared"
+shared_cols <- grep("^Shared-T[1-4]$", colnames(mat2_numeric), value = TRUE)
+umap_df$prop_shared <- rowSums(mat2_numeric[, shared_cols]) / rowSums(mat2_numeric)
+
+t1_cols <- grep("-T1$", colnames(mat2_numeric), value = TRUE)
+umap_df$prop_T1 <- rowSums(mat2_numeric[, t1_cols]) / rowSums(mat2_numeric)
+t3_cols <- grep("-T3$", colnames(mat2_numeric), value = TRUE)
+umap_df$prop_t3 <- rowSums(mat2_numeric[, t3_cols]) / rowSums(mat2_numeric)
+
+# Define cell type groups
+neuronal_cols <- grep("^Neuronal-T[1-4]$", colnames(mat2_numeric), value = TRUE)
+microglia_cols <- grep("^Microglia-T[1-4]$", colnames(mat2_numeric), value = TRUE)
+oligo_cols <- grep("^Oligodendrocytes-T[1-4]$", colnames(mat2_numeric), value = TRUE)
+
+# Calculate proportions
+total_links <- rowSums(mat2_numeric)
+umap_df$prop_neuronal <- rowSums(mat2_numeric[, neuronal_cols]) / total_links
+umap_df$prop_microglia <- rowSums(mat2_numeric[, microglia_cols]) / total_links
+umap_df$prop_oligo <- rowSums(mat2_numeric[, oligo_cols]) / total_links
+
+# Supplemental Figure
+pdf("UMAP_Link-genes_type_link.pdf",  width = 13, height = 10) #, units = "in", res = 300)
+p1<-ggplot(umap_df, aes(V1, V2, color=prop_shared)) +
+  geom_point(alpha=0.7) +
+  geom_text_repel(aes(label=gene), size=3) +
+  theme_classic() +
+  labs(x="UMAP1", y="UMAP2", title="Proportion shared cell type")+
+  scale_color_viridis_c()
+p2<-ggplot(umap_df, aes(x=V1, y=V2, color=prop_oligo)) +
+  geom_point() +
+  scale_color_viridis_c( option="B") +
+  theme_classic() +
+  labs(x="UMAP1", y="UMAP2", title="Proportion of Olig links")
+p3<-ggplot(umap_df, aes(x=V1, y=V2, color=prop_microglia)) +
+  geom_point() +
+  scale_color_viridis_c( option="B") +
+  theme_classic() +
+  labs(x="UMAP1", y="UMAP2", title="Proportion of Mic links")
+p4<-ggplot(umap_df, aes(x=V1, y=V2, color=prop_neuronal)) +
+  geom_point() +
+  scale_color_viridis_c( option="B") +
+  theme_classic() +
+  labs(x="UMAP1", y="UMAP2", title="Proportion of Neuronal links")
+
+plot_grid(p1,p2,p3,p4,nrow=2)
+dev.off()
+
+
+
+
+pdf("UMAP_Link-genes_T_cons.pdf",  width = 13, height = 6) #, units = "in", res = 300)
+t1<-ggplot(umap_df, aes(x=V1, y=V2, color=prop_T1)) +
+  geom_point() +
+  scale_color_viridis_c( option="A") +
+  theme_classic() +
+  labs(x="UMAP1", y="UMAP2", title="Proportion of T1 links")
+t3<-ggplot(umap_df, aes(x=V1, y=V2, color=prop_t3)) +
+  geom_point() +
+  scale_color_viridis_c( option="A") +
+  theme_classic() +
+  labs(x="UMAP1", y="UMAP2", title="Proportion of T3 links")
+
+plot_grid(t1,t3,nrow=1)
+dev.off()
+
+```
+
+### Microglia
+```{r, eval=F}
+pdf("UMAP_Link-genes_Microglia-zoom_moreGenes.pdf", width=10,height=10)
+ggplot(umap_df[which(umap_df$prop_microglia>0.2 & umap_df$V1>0),]) +
+  geom_point( aes( x=V1, y=V2,color=prop_T1)) +
+  scale_color_viridis_c( option="A") +
+  theme_classic() +
+  labs(title="Proportion of T1 links")+
+  geom_text_repel(data=umap_df[which(umap_df$prop_microglia>0.5  ),], aes(x=V1, y=V2,label=gene), max.overlaps=50)
+dev.off()
+
+"#465362"
+```
+
+
+#### FOS
+
+```{r, eval=F}
+
+FOS<-LINKS[which(LINKS$gene=="FOS" & LINKS$specificity_ct=="Microglia"),]
+
+FOS.signac<-LINKS.signac[which(LINKS.signac$gene=="FOS" & LINKS.signac$specificity_ct=="Microglia"),]
+FOS.signac<-FOS.signac[!(duplicated(FOS.signac$link)),]
+
+
+
+region<-GRanges(paste0(unique(seqnames(FOS)),":",min(start(LINKS.signac[which(LINKS.signac$gene=="FOS"),]))-5000, "-", max(end(LINKS.signac[which(LINKS.signac$gene=="FOS"),]))+5000))
+
+lp<-LinkPlot.height(FOS.signac, region)
+
+R_group<-Bed_PeakPlot(FOS, region, group.by="F_mod")+scale_color_manual(values=c(
+"R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R3"= "#619CFF","R4"= "#F564E3"))
+S_group<-Bed_PeakPlot(FOS, region, group.by="S_name")+scale_color_manual(values=c(
+"S0"= "#FCBBB6","S1"= "#DBCF80","#80DD9C","S3"= "#B0CEFF","S4"= "#FAB2R1"))
+
+
+CRE<-Bed_PeakPlot(enc4, region, group.by="cCRE")+ylab("cCREs")+scale_color_manual(values=c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me3"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen","None"="grey"))+theme(legend.position="none")
+
+ChIP<-Pileup(peaks[which(peaks$type=="NEG"),], region)
+
+phyloP<-BigwigTrack(region, "cross_species/external_data/cactus241way.phyloP.bw", smooth=200)+scale_fill_manual(values="midnightblue")+ylim(-2,8)+ylab("phyloP")+theme(legend.position="none")
+phastCons<-Bed_PeakPlot(phast, region)
+
+genes<-AnnotationPlot(data, region)
+HUMAN.plot<-CombineTracks(plotlist=list(lp,R_group,S_group,phastCons,phyloP,CRE,ChIP,genes),heights=c(3,1,1,1,2,1,2,3))
+
+pdf("FOS_linkPlot.pdf", width=7,height=5)
+HUMAN.plot
+dev.off()
+
+HUMAN.plot<-CombineTracks(plotlist=list(phastCons,phyloP,CRE,genes),heights=c(1,2,1,3))
+
+pdf("FOS_linkPlot_2.pdf", width=7,height=5)
+HUMAN.plot
+dev.off()
+
+
+```
+
+
+# TF Motifs and ChIP-seq Enrichment
+
+
+
+## Signac Motif Calls
+```{r, eval=F}
+library(Signac)
+library(Seurat)
+library(TFBSTools)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(patchwork)
+
+library(JASPAR2022)
+pfm <- getMatrixSet(
+  x = JASPAR2022,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+
+PB<-read.csv("~/cross_species/PEAKS/Pseudobulk_CellType-Species_ATAC-seq_matrix.csv")
+PEAKS.rd<-readRDS("~/cross_species/PEAKS/CONSENSUS_PEAKS_resize1kb_bin2kb_F-correction_wPhastCons_CellType.rds")
+
+map<-PB[,grepl(".map", colnames(PB))]
+PB<-PB[,!(grepl(".map",colnames(PB)))]
+rownames(PB)<-paste0(seqnames(PEAKS.rd[as.numeric(rownames(PB)),]),":",start(PEAKS.rd[as.numeric(rownames(PB)),]),"-",
+                     end(PEAKS.rd[as.numeric(rownames(PB)),]))
+PB<-as.matrix(PB)
+PB[is.na(PB)]<-0
+PB<-PB[,-1] #remove the X column
+PB<-PB[!(grepl("M",rownames(PB))),]
+
+# Create Signac object and add motif information
+chrom_assay <- CreateChromatinAssay(counts = PB,sep = c(":", "-"), min.cells = 1, min.features = 1)
+
+signac <- CreateSeuratObject(
+  counts = chrom_assay,
+  assay = "peaks",
+  meta.data = data.frame(species=sapply(strsplit(colnames(PB),".", fixed=T),`[`,1), celltype=sapply(strsplit(colnames(PB),".", fixed=T),`[`,2))
+)
+# Now make UMAP
+signac<-NormalizeData(signac)
+signac<-ScaleData(signac)
+signac<-FindVariableFeatures(signac, nfeatures=100000)
+top10 <- head(VariableFeatures(signac), 10)
+
+hvf.info <- HVFInfo(object = signac  )
+hvf.info$index<-rownames(hvf.info)
+
+# Go back to PB-profiles
+signac<-RunPCA(signac, features=hvf.info[which(hvf.info$variance.standardized>0.8),]$index) #this ran as SVD instead of PCA
+signac<-RunUMAP(signac, dims=1:8)
+
+
+# Add motifs 
+signac <- AddMotifs(object = signac,  genome = BSgenome.Hsapiens.UCSC.hg38,  pfm = pfm)
+
+valid_peaks <- rownames(GetAssayData(signac, slot = "motifs"))
+signac_filtered <- subset(signac, features = valid_peaks)
+
+
+```
+
+### Heatmap
+```{r, eval=F}
+# add annotations before computing regionstats to be used for selecting background regions
+DefaultAssay(signac_filtered)<-"peaks"
+library(AnnotationHub)
+ah <- AnnotationHub()
+ensdb_v98 <- ah[["AH75011"]]
+annotations <- GetGRangesFromEnsDb(ensdb = ensdb_v98)
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <- "hg38"
+Annotation(signac_filtered) <- annotations
+
+library(BSgenome.Hsapiens.UCSC.hg38)
+signac_filtered<-RegionStats(signac_filtered, genome=BSgenome.Hsapiens.UCSC.hg38)
+
+
+
+###########################################
+# Motif Enrichment
+PEAKS.rd$peak<-paste0(seqnames(PEAKS.rd),"-",start(PEAKS.rd),"-", end(PEAKS.rd))
+PEAKS.rd$F_ct<-paste0(PEAKS.rd$F_name,"-", PEAKS.rd$specificity_ct)
+Num_peaks<-table(PEAKS.rd$F_ct)
+
+F_names<-unique(PEAKS.rd$F_mod)
+ct<-unique(PEAKS.rd$specificity_ct)[-9]
+a<-1
+MOTIFS<-list()
+for(i in F_names){
+  for(j in ct){
+    tmp<-FindMotifs(object = signac_filtered,
+  features = PEAKS.rd[which(PEAKS.rd$F_mod==i & PEAKS.rd$specificity_ct==j),]$peak,
+  background= 50000)
+    tmp$F_name<-i
+    tmp$ct<-j
+    MOTIFS[[a]]<-tmp
+    a<-a+1
+  }
+}
+###########################################
+
+
+MOTIFS.r<-do.call(rbind, MOTIFS)
+df <- MOTIFS.r %>% mutate(F_ct = paste(F_name, ct, sep = "-"))
+#low number of peaks leading to high enrichment
+df<-df[which(df$F_ct %in% names(Num_peaks[Num_peaks>1000])),]
+
+saveRDS(MOTIFS.r, "~/cross_species/MOTIFS/MotifmatchR_motif_calls.rds")
+###########################################
+
+
+
+
+#only keep motifs that are sig in at least one ct
+MOTIFS.r2<-MOTIFS.r[which(MOTIFS.r$p.adjust<0.01),]
+MOTIFS.r2<-MOTIFS.r[which(MOTIFS.r$motif %in% MOTIFS.r2$motif),]
+df <- MOTIFS.r2 %>% mutate(F_ct = paste(F_name, ct, sep = "-"))
+df<-df[which(df$F_name!="R0"),]
+#low number of peaks leading to high enrichment
+df<-df[which(df$F_ct %in% names(Num_peaks[Num_peaks>1000])),]
+
+# make matrix
+# Spread the data into a matrix format to make heatmao
+mat <- df %>%
+  dplyr::mutate(F_ct = paste(F_name, ct, sep = "-")) %>%
+  dplyr::select(motif, F_ct, percent.observed) %>%
+  tidyr::pivot_wider(names_from = F_ct, values_from = percent.observed) %>%
+  tibble::column_to_rownames("motif")
+mat <- as.matrix(mat)
+rv<-apply(mat,1,sd)
+mat_plot<-mat[rv> quantile(rv, probs=0.5),]
+mat.s<-t(apply(mat_plot,1,scale))
+
+
+
+
+
+###########################################
+# Heatmap
+col_info <- strsplit(colnames(mat), "-", fixed = TRUE) %>% 
+  do.call(rbind, .) %>%
+  as.data.frame()
+colnames(col_info) <- c("F_name", "ct")
+
+Num_peaks2<-Num_peaks[colnames(mat)]
+# Create annotation
+col_anno <- HeatmapAnnotation(
+  F_name = col_info$F_name,
+  ct = col_info$ct,
+  col = list(
+    F_name = c("R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R3"= "#619CFF","R4"= "#F564E3"),
+    ct = c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3",
+           "OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60",
+           "Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1", "Shared"="grey20","Neuronal"="blue")
+  ))
+
+# add clusters
+motif_clusters<-read.table("scAnalysis/JASPAR/clusters_motif_names.tab")
+motif_long <- motif_clusters %>%
+  separate_rows(V2, sep = ",") %>%   # split motif strings by comma
+  rename(cluster_motif = V1, motif = V2)   # rename columns for clarity
+motif_long$cluster_short<-ifelse(motif_long$cluster_motif %in% all_motifs.merge$cluster_motif, motif_long$cluster_motif,"Other") #pull from chromBPnet clusters shown
+
+motif_long<-merge(MOTIFS.r2[,c(1,8)],motif_long, by.y="motif",by.x="motif.name")
+motif_long<-motif_long[!duplicated(motif_long$motif),]
+rownames(motif_long)<-motif_long$motif
+motif_long<-motif_long[rownames(mat_plot),]
+
+
+col_info$clust<-ifelse(col_info$ct %in% c("Inhibitory","Excitatory","Neuronal"),"Neuronal",
+                       ifelse(col_info$ct %in% c("OPCs","Oligodendrocytes","Astrocytes"),"Glia", col_info$ct))
+library(RColorBrewer)
+clusters <- unique(motif_long$cluster_short)
+clusters[is.na(clusters)] <- "NA"
+palette <- brewer.pal(12, "Set3")  # max 12 colors in Set3
+palette_big <- c(brewer.pal(12, "Set3"), brewer.pal(8, "Set2"), brewer.pal(8, "Dark2"))
+cluster_colors <- setNames(palette_big[seq_along(clusters)], clusters)
+ra<-rowAnnotation(motif_cluster=motif_long$cluster_short)
+
+
+highlight_motifs <- c("Spi1","Irf9","Stat1::Stat2","Runx1","Nr1h3::Rxra","Rxra",
+  "Nr2f6","Ikzf1","Rest","Ctcf","Myc","E2f6","Tfdp1","Yy1","Yy2",
+  "Nfkb1","Egr1","Fos::Jun","Fosl1","Fosl2","Tbr1","Mef2a","Mef2c",
+  "Neurog1","Tead4","Olig1","Neurod1","Ptf1a","Tcf12","Pou3f4",
+  "Pou4f1","Meis1","Pbx2","Pbx3","Pknox1","Onecut1","Onecut3",
+  "Phox2b","Pou5f1::Sox2",
+  "Stat1","Stat2","Stat3","Stat4","Stat5a","Stat5b","Stat6",
+  "Sp1","Sp9",
+  "Sox2","Sox4","Sox5","Sox9","Sox10"
+)
+highlight_motifs <- c(
+  "Spi1","Nfkb1","Ctcf","Yy1","Yy2","Runx1",
+  "Fos::Jun","Fosl1","Fosl2","Egr1","Myc",
+  "Sp1","Sp2","Sp3",
+  "Mef2a","Mef2c","Rfx3",
+  "Sox2","Sox3","Sox4","Sox5","Sox9",
+  "Neurog1","Neurod1","Tbr1","Tead4",
+  "Rest","Onecut1","Onecut3","Meis1","Pbx3", "Pknox1"
+)
+
+highlight_motifs<-c(highlight_motifs, toupper(highlight_motifs))
+
+
+motif_map <- MOTIFS.r[!(duplicated(MOTIFS.r$motif)),] %>% select(motif, motif.name)
+
+# Map IDs to names in matrix row order
+row_names_df <- data.frame(motif = rownames(mat.s)) %>%
+  left_join(motif_map, by = "motif")
+
+# Find which rows to mark
+rows_to_mark <- which(row_names_df$motif.name %in% highlight_motifs)
+labels_to_mark <- row_names_df$motif.name[rows_to_mark]
+
+
+ra <- rowAnnotation(
+  motif_cluster = motif_long$cluster_short,
+  col = list(motif_cluster = cluster_colors),
+  TFs = anno_mark(at = rows_to_mark, labels = labels_to_mark)
+)
+ht<-Heatmap( mat.s, name = "Z-score prop", top_annotation = col_anno, show_column_names = FALSE,show_row_names = FALSE,  cluster_rows = TRUE, cluster_columns = TRUE,
+         colorRamp2(c(-1,0, 0.5,3), magma(4)), column_split=col_info$clust, row_km=4, right_annotation=ra)
+
+pdf("Motif_proportion_.pdf", width=10,height=10)
+ht
+dev.off()
+
+
+```
+
+
+
+## chromBPnet motif discovery
+
+### Submit
+```{bash, eval=F}
+conda activate chrombpnet
+
+# create a matched background set
+chrombpnet prep nonpeaks \
+-g cross_species/chromBPnet/hg38.genome.fa \
+-p 1224_1230_DLPFC_NeuN_overlap.conservative_peak.narrowPeak.gz \
+-c  cross_species/chromBPnet/hg38.chrom.sizes \
+-fl cross_species/chromBPnet/folds/fold_0.json \
+-o  ~/cross_species/chromBPnet/background 
+
+
+
+
+
+```
+
+
+
+```{bash, eval=F}
+#!/bin/bash
+
+. /opt/conda/etc/profile.d/conda.sh
+conda activate base
+
+echo "Checking GPU with nvidia-smi..."
+nvidia-smi || echo " No GPU found or drivers not available"
+
+python -c "import tensorflow as tf; import tensorflow_probability as tfp; print(tf.__version__, tfp.__version__); print(tf.config.list_physical_devices('GPU'))"
+
+chrombpnet pipeline \
+  -itag 1238_1242_DLPFC_NeuN_basename_prefix.pooled.tagAlign.gz \
+  -d "ATAC" \
+  -g cross_species/chromBPnet/hg38.genome.fa \
+  -c cross_species/chromBPnet/hg38.chrom.sizes \
+  -p 1238_1242_DLPFC_NeuN_overlap.conservative_peak.narrowPeak.gz \
+  -n cross_species/chromBPnet/background_negatives.bed \
+  -fl cross_species/chromBPnet/folds/fold_0.json \
+  -b cross_species/chromBPnet/bias_models/ATAC/ENCSR868FGK_bias_fold_0.h5 \
+  -o 1238_1242_DLPFC_NeuN_GPU
+```
+
+
+
+```{r, eval=F}
+library(rvest)
+library(dplyr)
+library(purrr)
+library(ComplexUpset)
+library(dplyr)
+library(tidyr)
+
+
+# List of species directories and names
+species_dirs <- c(
+  "1238_1242_DLPFC_NeuN_GPU",
+  "Cat_NEUN",
+  "cow_NEUN",
+  "horse_NEUN"
+)
+
+species_names <- c("Human", "Cat", "Cow", "Horse")
+
+# Function to extract the motif table from a motifs.html
+extract_motif_table <- function(html_file, species_name) {
+  html <- read_html(html_file)
+  
+  tbl <- html %>%
+    html_node("table") %>%
+    html_table(fill = TRUE)
+  
+  # Ensure standard column names
+  colnames(tbl) <- c("pattern", "num_seqlets",
+                     "cwm_fwd", "cwm_rev",
+                     "match0", "qval0", "match0_logo",
+                     "match1", "qval1", "match1_logo",
+                     "match2", "qval2", "match2_logo")
+  
+  # Convert qvals
+  tbl$qval0 <- as.numeric(tbl$qval0)
+  tbl$qval1 <- as.numeric(tbl$qval1)
+  tbl$qval2 <- as.numeric(tbl$qval2)
+  tbl$num_seqlets <- as.integer(tbl$num_seqlets)
+  
+  tbl$species <- species_name
+  
+  return(tbl)
+}
+
+# Loop through all species
+motif_tables <- map2(
+  file.path("~/cross_species/chromBPnet", species_dirs, "evaluation/modisco_profile/motifs.html"),
+  species_names,
+  extract_motif_table
+)
+
+# Combine all into one long dataframe
+all_motifs <- bind_rows(motif_tables)
+
+# Optionally save to CSV
+write.csv(all_motifs, "~/cross_species/chromBPnet/combined_motifs_by_species.csv", row.names = FALSE)
+
+
+#############################################
+#############################################
+
+
+shared_table <- all_motifs %>%
+  filter(qval0 < 0.001) %>%    # only confident motif matches
+  count(match0, species) %>%
+  pivot_wider(names_from = species, values_from = n, values_fill = 0)
+
+library(tibble)
+motif_matrix <- shared_table %>%
+  mutate(across(-match0, ~ as.integer(. > 0))) %>%
+  column_to_rownames("match0")
+
+pdf("chromBPnet_upSet_motifDiscovery.pdf")
+ComplexUpset::upset(as.data.frame(motif_matrix), 
+                    intersect = colnames(motif_matrix),
+                    name = "Species sharing",
+                    width_ratio = 0.2)
+dev.off()
+
+
+other_only <- all_motifs %>%
+  filter(qval0 < 0.001) %>%
+  mutate(family = case_when(
+    grepl("CTCF", match0) ~ "CTCF",
+    grepl("MER2", match0) ~ "MER2",
+    grepl("RFX", match0) ~ "RFX",
+    grepl("SP[0-9]", match0) ~ "SP/KLF",
+    TRUE ~ "Other"
+  )) %>%
+  filter(family == "Other") %>%
+  distinct(match0, species) %>%
+  mutate(present=1) %>%
+  pivot_wider(names_from=species, values_from=present, values_fill=0)
+
+# Make the upset plot
+pdf("chromBPnet_upSet_motifDiscovery-FAMILY.pdf")
+ComplexUpset::upset(as.data.frame(other_only[,-1]),
+                    intersect=colnames(other_only)[-1],
+                    name="Shared Other motifs",
+                    width_ratio=0.2)
+dev.off()
+
+
+```
+
+```{r, eval=F}
+motif_clusters<-read.table("scAnalysis/JASPAR/clusters_motif_names.tab")
+motif_long <- motif_clusters %>%
+  separate_rows(V2, sep = ",") %>%   # split motif strings by comma
+  rename(cluster_motif = V1, motif = V2)   # rename columns for clarity
+motif_long$motif<-toupper(motif_long$motif)
+all_motifs$motif<-toupper(sapply(strsplit(all_motifs$match0,"_"),`[`,1))
+
+
+all_motifs.merge<-merge(all_motifs, motif_long, by="motif", all.x=T)
+all_motifs.merge<-all_motifs.merge[!(duplicated(all_motifs.merge$qval0)),]
+all_motifs.merge$cluster_motif[is.na(all_motifs.merge$cluster_motif)]<-all_motifs.merge$family[is.na(all_motifs.merge$cluster_motif)]
+
+cluster_colors2<-cluster_colors
+cluster_colors2[["cluster_1"]]<-"#231f20"
+pdf("chromBPnet_Scatter_Motif-discovery.pdf", width=5, height=4)
+ggplot(all_motifs.merge[!(grepl("DNASE", all_motifs.merge$match0)),], aes(x=num_seqlets, y=-log10(qval0)))+geom_point(aes(color=cluster_motif, shape=species))+geom_text_repel(aes(label=motif))+theme_classic()+scale_color_manual(guide="none", values=cluster_colors2)
+dev.off()
+
+```
+
+## Loupe et al. Enrichment
+
+```{r, eval=F}
+union_files<-as.list(readLines("BrainTF/unlist_files.csv"))
+m=gsub(".csv","", unlist(union_files))
+m=sapply(strsplit(m, "/"),`[`,7)
+union_list=lapply(union_files,function(x){
+  tmp<-readRDS(x)
+ })
+
+tf_gr<-do.call(c, union_list)
+
+
+
+tf_gr<-do.call(c, union_list)
+tf_gr_DLPFC<-tf_gr[which(tf_gr$Tissue=="DLPFC"),]
+
+
+
+PEAKS.rd$group <- paste0(PEAKS.rd$F_mod, "-", PEAKS.rd$specificity_ct)
+
+PEAKS.TF<-subsetByOverlaps(PEAKS.rd, tf_gr_DLPFC)
+
+# Create a list of peaks per conservation-cell type group
+peak_groups <- split(PEAKS.TF, PEAKS.TF$group)
+peak_groups<-peak_groups[lengths(peak_groups)>250]
+
+# Get unique TF names
+tf_names <- unique(tf_gr$name)
+
+
+results_list_sort <- list()
+# Loop through each sorted population type
+for (sorted_type in unique(tf_gr_DLPFC$type)) {
+  # Subset TFs by population
+  tf_sub <- tf_gr_DLPFC[tf_gr_DLPFC$type == sorted_type]
+  tf_names <- unique(tf_sub$name)
+  
+  for (group_name in names(peak_groups)) {
+    peaks_subset <- peak_groups[[group_name]]
+    total_peaks <- length(peaks_subset)
+    
+    ov <- findOverlaps(peaks_subset, tf_sub)
+    df <- data.frame(
+      peak = queryHits(ov),
+      tf = tf_sub$name[subjectHits(ov)]
+    ) %>% distinct()
+    
+    tf_counts <- df %>%
+      group_by(tf) %>%
+      summarise(overlapping_peaks = n(), .groups = "drop") %>%
+      mutate(
+        proportion = overlapping_peaks / total_peaks,
+        group = group_name,
+        sorted_type = sorted_type
+      )
+    
+    results_list_sort[[paste0(sorted_type, "_", group_name)]] <- tf_counts
+  }
+}
+
+# Combine all results
+results_df_sort <- bind_rows(results_list_sort)
+
+
+Num_peaks<-data.frame(Num=lengths(peak_groups), group=names(peak_groups))
+
+mer<-merge(results_df_sort, Num_peaks, by="group")
+mer$F_mod<-sapply(strsplit(mer$group,"-"),`[`,1)
+mer$ct<-sapply(strsplit(mer$group,"-"),`[`,2)
+
+mer$group2<-paste0(mer$tf,"-",mer$sorted_type,"-",mer$ct)
+groups<-unique(mer$group2)
+
+results<-list()
+for(i in 1:length(groups)){
+  sub<-mer[which(mer$group2==groups[i] & mer$F_mod %in% c("R1","R2","R3","R4")),]
+  sub1<-sub[which(sub$F_mod %in% c( "R2", "R1")),]
+  A1<-sum(sub1$overlapping_peaks)
+  A2<-sum(sub1$Num)
+  sub2<-sub[which(sub$F_mod %in% c("R3","R4")),]
+  B1<-sum(sub2$overlapping_peaks)
+  B2<-sum(sub2$Num)
+  if(nrow(sub)>1){
+    mat<-matrix(data=c(A1,A2-A1,B1,B2-B1), nrow=2)
+    ft=fisher.test(mat)
+    results[[i]]<-c(groups[i],A1/A2,B1/B2, ft$p.value, ft$estimate)
+  }
+}
+
+results<-do.call(rbind,results)
+results<-as.data.frame(results)
+colnames(results)<-c("group","R2_prop","R3_prop","p.value","OR")
+results$p.adj<-p.adjust(results$p.value, method="BH")
+
+results$OR<-as.numeric(results$OR)
+results$R2_prop<-as.numeric(results$R2_prop)
+results$R3_prop<-as.numeric(results$R3_prop)
+results$tf<-sapply(strsplit(results$group,"-"),`[`,1)
+results$ct<-sapply(strsplit(results$group,"-"),`[`,3)
+results$sort<-sapply(strsplit(results$group,"-"),`[`,2)
+
+results2<-results[which(results$R2_prop>0.05 | results$R3_prop>0.05),]
+results2$log2OR<-log2(results2$OR)
+results2$keep<-ifelse(results2$ct %in% c("Excitatory","Neuronal") & results2$sort=="NEUN",T,
+                      ifelse(results2$ct=="Microglia"& results2$sort=="NEG",T,
+                             ifelse(results2$ct=="Oligodendrocytes" & results2$sort=="OLIG", T, F)))
+
+saveRDS(results2, "~/cross_species/BrainTF_enrichments_R12_v_R34_reduceFP_onlyDLPFC.rds")
+
+
+pdf("volcanoPlot_BrainTF_overlaps_R12-R34_onlyDLPFCT.pdf", width=5,height=5)
+ggplot(results2[which(results2$keep==T),], aes(x=log2OR,y= -log10(p.adj), color=ct))+geom_point()+theme_classic()+geom_text_repel(aes(label=tf))+geom_vline(xintercept=0,lty="dashed",color="grey")+scale_color_manual(values=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3",
+           "OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60",
+           "Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1", "Shared"="grey20","Neuronal"="blue"))
+dev.off()
+
+
+
+pdf("scatterPlot_BrainTF_overlaps_R12-R34_onlyDLPFCT.pdf", width=5,height=5)
+ggplot(results, aes(x=R2_prop, y=R3_prop, color=sort))+geom_point()+theme_classic()
+dev.off()
+```
+
+
+
+
+### REST
+```{r, eval=F}
+REST.mic<-subsetByOverlaps(PEAKS.rd[which( PEAKS.rd$specificity_ct=="Microglia"),], tf_gr[which(tf_gr$name=="REST" & tf_gr$type=="NEG"),])
+REST.mic.R1R2<- REST.mic[which(REST.mic$F_mod %in% c("R1","R2")),]
+REST.mic.R3R4<- REST.mic[which(REST.mic$F_mod %in% c("R3","R4")),]
+
+
+tmp1<-unique(subsetByOverlaps(LINKS, REST.mic.R1R2)$gene)
+tmp2<-unique(subsetByOverlaps(LINKS, REST.mic.R3R4)$gene)
+background<-unique(subsetByOverlaps(LINKS, PEAKS.rd[which(PEAKS.rd$specificity_ct=="Microglia"),])$gene)
+
+
+go_file<- "~/cross_species/external_data/GO_Biological_Process_2025.txt"
+REST.enrich.R1R2<-enrichr_custom_bg(tmp1, background, go_file)
+REST.enrich.R3R4<-enrichr_custom_bg(tmp2, background, go_file)
+
+REST.enrich.R1R2$group<-"recent"
+REST.enrich.R3R4$group<-"conserved"
+REST.enrich<-rbind(REST.enrich.R1R2,REST.enrich.R3R4)
+top<-REST.enrich %>% group_by(group) %>% top_n(n=3, wt=-HG.adj.P.value)
+
+pdf("REST_GO-enrichments_R1R2-v-R3R4.pdf", width=10, height=5)
+ggplot(REST.enrich[which(REST.enrich$Term %in% top$Term),], aes(x= -log10(HG.adj.P.value), y=Term, fill=group))+geom_bar(stat="identity", position="dodge")+theme_classic()
+dev.off()
+
+write.csv(REST.enrich, "~/cross_species/REST_microglia_GO_enrichment.csv")
+
+
+# Interleukin-6 is stimulated by A-beta --> AD
+genes_check<-unlist(strsplit(REST.enrich.R1R2[3,]$OverlapGenes,","))
+subsetByOverlaps(LINKS[which(LINKS$gene %in% genes_check),], REST.mic.R1R2)
+
+```
+                                                                                        Term
+1                                                         Inflammatory Response (GO:0006954)
+2                          Positive Regulation of Response to External Stimulus (GO:0032103)
+3                                  Positive Regulation of Inflammatory Response (GO:0050729)
+4                                           Cytokine-Mediated Signaling Pathway (GO:0019221)
+5                                    Positive Regulation of Cytokine Production (GO:0001819)
+6                                Regulation of Tumor Necrosis Factor Production (GO:0032680)
+7                                                     Defense Response to Virus (GO:0051607)
+8  Positive Regulation of Tumor Necrosis Factor Superfamily Cytokine Production (GO:1903557)
+9                       Positive Regulation of Tumor Necrosis Factor Production (GO:0032760)
+10                        Regulation of Canonical NF-kappaB Signal Transduction (GO:0043122)
+
+
+### CREB
+```{r, eval=F}
+CREB.mic<-subsetByOverlaps(PEAKS.rd[which( PEAKS.rd$specificity_ct %in% c("Neuronal", "Excitatory" )),], tf_gr[which(tf_gr$name=="CREB" & tf_gr$type=="NEUN"),])
+CREB.mic.R1R2<- CREB.mic[which(CREB.mic$F_mod %in% c("R1","R2")),]
+CREB.mic.R3R4<- CREB.mic[which(CREB.mic$F_mod %in% c("R3","R4")),]
+
+tmp1<-unique(subsetByOverlaps(LINKS, CREB.mic.R1R2)$gene)
+tmp2<-unique(subsetByOverlaps(LINKS, CREB.mic.R3R4)$gene)
+background<-unique(subsetByOverlaps(LINKS, PEAKS.rd[which(PEAKS.rd$specificity_ct %in% c("Neuronal", "Excitatory" )),])$gene)
+
+
+go_file<- "~/cross_species/external_data/GO_Biological_Process_2025.txt"
+CREB.enrich.R1R2<-enrichr_custom_bg(tmp1, background, go_file)
+CREB.enrich.R3R4<-enrichr_custom_bg( tmp2, background, go_file)
+
+CREB.enrich.R1R2$group<-"recent"
+CREB.enrich.R3R4$group<-"conserved"
+CREB.enrich<-rbind(CREB.enrich.R1R2,CREB.enrich.R3R4)
+top<-CREB.enrich[which(CREB.enrich$HG.adj.P.value<0.05),] %>% group_by(group) %>% top_n(n=10, wt= -HG.adj.P.value)
+
+pdf("CREB_GO-enrichments_R1R2-v-R3R4.pdf", width=10, height=5)
+ggplot(CREB.enrich[which(CREB.enrich$Term %in% top$Term),], aes(x= -log10(HG.P.value), y=Term, fill=group))+geom_bar(stat="identity", position="dodge")+theme_classic()
+dev.off()
+
+
+write.csv(CREB.enrich, "~/cross_species/CREB_neuron_GO_enrichment.csv")
+
+```
+
+
+```{r, eval=F}
+CREB.mic<-subsetByOverlaps(PEAKS.rd[which( PEAKS.rd$specificity_ct %in% c("Microglia" ) ),], tf_gr[which(tf_gr$name=="CREB" & tf_gr$type=="NEG"),])
+CREB.mic.R1R2<- CREB.mic[which(CREB.mic$F_mod %in% c("R1","R2")),]
+CREB.mic.R3R4<- CREB.mic[which(CREB.mic$F_mod %in% c("R3","R4")),]
+
+tmp1<-unique(subsetByOverlaps(LINKS, CREB.mic.R1R2)$gene)
+tmp2<-unique(subsetByOverlaps(LINKS, CREB.mic.R3R4)$gene)
+background<-unique(subsetByOverlaps(LINKS, PEAKS.rd[which(PEAKS.rd$specificity_ct %in% c("Microglia" ) ),])$gene)
+
+
+go_file<- "~/cross_species/external_data/GO_Biological_Process_2025.txt"
+CREB.enrich.R1R2<-enrichr_custom_bg(tmp1, background, go_file)
+CREB.enrich.R3R4<-enrichr_custom_bg( tmp2, background, go_file)
+
+CREB.enrich.R1R2$group<-"recent"
+CREB.enrich.R3R4$group<-"conserved"
+CREB.enrich<-rbind(CREB.enrich.R1R2,CREB.enrich.R3R4)
+top<-CREB.enrich[which(CREB.enrich$HG.adj.P.value<0.05),] %>% group_by(group) %>% top_n(n=4, wt= -HG.adj.P.value)
+
+pdf("CREB-NEG_GO-enrichments_R1R2-v-R3R4.pdf", width=10, height=5)
+ggplot(CREB.enrich[which(CREB.enrich$Term %in% top$Term),], aes(x= -log10(HG.P.value), y=Term, fill=group))+geom_bar(stat="identity", position="dodge")+theme_classic()
+dev.off()
+
+
+write.csv(CREB.enrich, "~/cross_species/CREB_microglia_GO_enrichment.csv")
+
+```
+
+
+### NEUROD1
+```{r, eval=F}
+CREB.mic<-subsetByOverlaps(PEAKS.rd[which( PEAKS.rd$specificity_ct %in% c( "Excitatory" )),], tf_gr[which(tf_gr$name=="NEUROD1" & tf_gr$type=="NEUN" & tf_gr$Tissue=="DLPFC"),])
+CREB.mic.R1R2<- CREB.mic[which(CREB.mic$F_mod %in% c("R1","R2")),]
+CREB.mic.R3R4<- CREB.mic[which(CREB.mic$F_mod %in% c("R3","R4")),]
+
+tmp1<-unique(subsetByOverlaps(LINKS[which(LINKS$T_mod!="T0"),], CREB.mic.R1R2)$gene)
+tmp2<-unique(subsetByOverlaps(LINKS[which(LINKS$T_mod!="T0"),], CREB.mic.R3R4)$gene)
+background<-unique(subsetByOverlaps(LINKS, PEAKS.rd[which(PEAKS.rd$specificity_ct %in% c("Excitatory") & PEAKS.rd$F_mod!="R0"),])$gene)
+
+
+go_file<- "~/cross_species/external_data/GO_Biological_Process_2025.txt"
+CREB.enrich.R1R2<-enrichr_custom_bg(tmp1, background, go_file)
+CREB.enrich.R3R4<-enrichr_custom_bg( tmp2, background, go_file)
+
+CREB.enrich.R1R2$group<-"recent"
+CREB.enrich.R3R4$group<-"conserved"
+CREB.enrich<-rbind(CREB.enrich.R1R2,CREB.enrich.R3R4)
+top<-CREB.enrich[which(CREB.enrich$HG.adj.P.value<0.05),] %>% group_by(group) %>% top_n(n=10, wt= -HG.adj.P.value)
+
+pdf("NEUROD1-NEUN_GO-enrichments_R1R2-v-R3R4.pdf", width=10, height=5)
+ggplot(CREB.enrich[which(CREB.enrich$Term %in% top$Term),], aes(x= -log10(HG.P.value), y=Term, fill=group))+geom_bar(stat="identity", position="dodge")+theme_classic()
+dev.off()
+
+write.csv(CREB.enrich, "~/cross_species/NEUROD1_neuron_GO_enrichment.csv")
+
+
+dbs <- c("GO_Molecular_Function_2025", "GO_Cellular_Component_2025", "GO_Biological_Process_2025", "KEGG_2021_Human","Azimuth_Cell_Types_2021")
+CREB.enrich.R1R2<-enrichr(tmp1, dbs)[["GO_Biological_Process_2025"]]
+CREB.enrich.R3R4<-enrichr(tmp2, dbs)[["GO_Biological_Process_2025"]]
+
+CREB.enrich.R1R2$group<-"recent"
+CREB.enrich.R3R4$group<-"conserved"
+CREB.enrich<-rbind(CREB.enrich.R1R2,CREB.enrich.R3R4)
+top<-CREB.enrich[which(CREB.enrich$Adjusted.P.value<0.05),] %>% group_by(group) %>% top_n(n=10, wt= -Adjusted.P.value)
+
+```
+
+
+### CTCF
+```{r, eval=F}
+CREB.mic<-subsetByOverlaps(PEAKS.rd[which( PEAKS.rd$specificity_ct %in% c( "Neuronal" )),], tf_gr[which(tf_gr$name=="CTCF" & tf_gr$type=="NEUN" & tf_gr$Tissue=="DLPFC"),])
+CREB.mic.R1R2<- CREB.mic[which(CREB.mic$F_mod %in% c("R1","R2")),]
+CREB.mic.R3R4<- CREB.mic[which(CREB.mic$F_mod %in% c("R3","R4")),]
+
+tmp1<-unique(subsetByOverlaps(LINKS[which(LINKS$T_mod!="T0"),], CREB.mic.R1R2)$gene)
+tmp2<-unique(subsetByOverlaps(LINKS[which(LINKS$T_mod!="T0"),], CREB.mic.R3R4)$gene)
+background<-unique(subsetByOverlaps(LINKS, PEAKS.rd[which(PEAKS.rd$specificity_ct %in% c("Neuronal") & PEAKS.rd$F_mod!="R0"),])$gene)
+
+
+go_file<- "~/cross_species/external_data/GO_Biological_Process_2025.txt"
+CREB.enrich.R1R2<-enrichr_custom_bg(tmp1, background, go_file)
+CREB.enrich.R3R4<-enrichr_custom_bg( tmp2, background, go_file)
+
+CREB.enrich.R1R2$group<-"recent"
+CREB.enrich.R3R4$group<-"conserved"
+CREB.enrich<-rbind(CREB.enrich.R1R2,CREB.enrich.R3R4)
+top<-CREB.enrich[which(CREB.enrich$HG.adj.P.value<0.1),] %>% group_by(group) %>% top_n(n=5, wt= -HG.adj.P.value)
+
+pdf("CTCF-NEUN_GO-enrichments_R1R2-v-R3R4.pdf", width=10, height=5)
+ggplot(CREB.enrich[which(CREB.enrich$Term %in% top$Term),], aes(x= -log10(HG.P.value), y=Term, fill=group))+geom_bar(stat="identity", position="dodge")+theme_classic()
+dev.off()
+
+write.csv(CREB.enrich, "~/cross_species/CTCF_neuron_GO_enrichment.csv")
+
+
+dbs <- c("GO_Molecular_Function_2025", "GO_Cellular_Component_2025", "GO_Biological_Process_2025", "KEGG_2021_Human","Azimuth_Cell_Types_2021")
+CREB.enrich.R1R2<-enrichr(tmp1, dbs)[["GO_Biological_Process_2025"]]
+CREB.enrich.R3R4<-enrichr(tmp2, dbs)[["GO_Biological_Process_2025"]]
+
+CREB.enrich.R1R2$group<-"recent"
+CREB.enrich.R3R4$group<-"conserved"
+CREB.enrich<-rbind(CREB.enrich.R1R2,CREB.enrich.R3R4)
+top<-CREB.enrich[which(CREB.enrich$Adjusted.P.value<0.05),] %>% group_by(group) %>% top_n(n=10, wt= -Adjusted.P.value)
+
+```
+
+# Human lost (HL) cCREs
+
+## HAR/hCONDEL
+```{r, eval=F}
+
+PEAKS.rd$num_species<-str_count(PEAKS.rd$species,"&")+1
+PEAKS.rd$HumanLost<-PEAKS.rd$num_species>7 & PEAKS.rd$F_name=="R0"
+
+HL<-PEAKS.rd[which(PEAKS.rd$HumanLost==T),]
+
+
+
+
+HAR<-read.csv("~/cross_species/external_data/zooHARs.csv")
+HAR<-GRanges(HAR)
+HL$HAR<-F
+ol<-findOverlaps(HL, HAR)
+HL[queryHits(ol)]$HAR<-T #only 2 overlap HARs
+
+
+
+
+hCONDEL<-GRanges(read.csv("~/cross_species/external_data/hCONDEL_MPRA_hg38_positions.csv"))
+HL$hCONDEL<-F
+ol<-findOverlaps(HL, hCONDEL)
+HL[queryHits(ol)]$hCONDEL<-T #only 41 overlap HARs (28/41 came from shared or neuronal)
+
+43/length(PEAKS.rd[which(PEAKS.rd$HumanLost==T),])
+#0.0222
+
+
+
+
+
+
+overlap_HAR <- countOverlaps(HL, HAR) > 0
+overlap_hCONDEL <- countOverlaps(HL, hCONDEL) > 0
+
+# Proportions
+total_HL <- length(HL)
+percent_HAR <- sum(overlap_HAR) / total_HL * 100
+percent_hCONDEL <- sum(overlap_hCONDEL) / total_HL * 100
+
+# Data frame for plotting
+df <- data.frame(
+  Annotation = c("HAR", "hCONDEL"),
+  PercentOverlap = c(percent_HAR, percent_hCONDEL)
+)
+
+```
+
+## Psuedobulk profiles
+
+```{r, eval=F}
+PB<-read.csv("~/cross_species/PEAKS/Pseudobulk_CellType-Species_ATAC-seq_matrix.csv")
+rownames(PB)<-as.character(rownames(PB))
+
+map<-PB[,grepl(".map", colnames(PB))]
+PB<-PB[,!(grepl(".map",colnames(PB)))]
+PB[is.na(PB)]<-0
+PB<-PB[,-1] #remove the X column
+PB.norm<-cpm(PB)
+
+HL<-PEAKS.rd[which(PEAKS.rd$HumanLost==T & PEAKS.rd$NEG_HOT=="None"),]
+#bring in HAR annotation
+
+
+
+
+
+# format accessibility profiles for heatmap
+HL.PB<-PB.norm[rownames(PB.norm) %in% HL[which(HL$BULK_HOT=="None" ),]$index,]
+HL.map<-map[rownames(map) %in% HL[which(HL$BULK_HOT=="None"),]$index,]
+
+meta<-as.data.frame(colnames(HL.PB))
+meta$species<-sapply(strsplit(meta[,1],".", fixed=T),`[`,1)
+meta$ct<-sapply(strsplit(meta[,1],".", fixed=T),`[`,2)
+colnames(meta)[1]<-"name"
+
+HL.PB<-HL.PB[,!(meta$ct %in% c("Pericytes","Endothelial"))]
+meta<-meta[!(meta$ct %in% c("Pericytes","Endothelial")),]
+
+
+
+
+
+
+
+
+ra<-rowAnnotation(ct.specific=HL[which(HL$BULK_HOT=="None"),]$specificity_ct,  col=list(ct.specific=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1", "Shared"="grey25", "Neuronal"="blue")))
+
+ha<-HeatmapAnnotation(celltype=meta$ct, species=meta$species, 
+                   col=list(celltype=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1"), 
+        species=c(
+  # Primates (all in a blue family)
+  "human"    = "darkorchid4",  
+  "macaque"  = "#66A9D1",  
+  "marmoset" = "#A1C6EA",  
+  # Rodents (vibrant greens)
+  "mouse"    = "#009E73", 
+  "rat"      = "#66C2A5", 
+    # Other mammals (vibrant oranges)
+  "cat"      = "#D95R02",  
+  "cow"      = "#R2B701",  
+  "horse"    = "#R46D43",  
+  "rabbit"   = "#FEE08B"   
+)
+))
+
+
+h1=Heatmap(HL.PB, name="Normalized Accessiblity", col=colorRamp2(c(0,0.01,1,3,10), c("black", "black", viridis(3))), cluster_rows=T,right_annotation=ra, use_raster=T, show_row_names=F,show_column_names=F, show_row_dend = FALSE, top_annotation=ha,row_split=HL[which(HL$BULK_HOT=="None"),]$specificity_ct, column_split= ifelse(meta$species=="human", "A", meta$ct))
+
+meta2<-as.data.frame(colnames(HL.map))
+meta2$species<-sapply(strsplit(meta2[,1],".", fixed=T),`[`,1)
+ha2<-HeatmapAnnotation(species=meta2$species, 
+                   col=list(species=c(
+  # Primates (all in a blue family)
+  "human"    = "darkorchid4",  
+  "macaque"  = "#66A9D1",  
+  "marmoset" = "#A1C6EA",  
+  
+  # Rodents (vibrant greens)
+  "mouse"    = "#009E73", 
+  "rat"      = "#66C2A5", 
+    # Other mammals (vibrant oranges)
+  "cat"      = "#D95R02",  
+  "cow"      = "#R2B701",  
+  "horse"    = "#R46D43",  
+  "rabbit"   = "#FEE08B"   
+)
+))
+
+h2=Heatmap(HL.map, name="Map Ratio", col=colorRamp2(c(0.25,0.85,1), c("blue","white","red")), cluster_rows=F, use_raster=T, show_row_names=F, show_row_dend = FALSE, top_annotation=ha2)
+
+
+pdf("Cross_species_pseudobulk-HEATMAP_Human-Lost_062525.pdf", width=10,height=8)
+h1+h2
+dev.off()
+
+```
+
+
+## cell type-specificity
+
+```{r, eval=F}
+ct_names<-unique(PEAKS.rd$specificity_ct)[-9]
+
+enrich <- do.call(rbind, lapply(ct_names, function(ct) {
+  tab <- table(PEAKS.rd$specificity_ct == ct, PEAKS.rd$HumanLost )
+  ft <- fisher.test(tab)
+  ci <- ft$conf.int
+  data.frame(
+    cell_type = ct,
+    odds_ratio = ft$estimate,
+    p_value    = ft$p.value,
+    lower_ci   = ci[1],
+    upper_ci   = ci[2],
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Add log2 odds, CI, and star‑significance
+enrich <- enrich %>%
+  mutate(
+    log2OR    = log2(odds_ratio),log2_lower = log2(lower_ci),log2_upper = log2(upper_ci),sig = case_when(p_value < 0.001 ~ "***",p_value < 0.01  ~ "**",p_value < 0.05  ~ "*",TRUE~ "ns"    )
+  )
+
+pdf("cell-type-specificty_human-lost_peaks-ENRICHMENT.pdf", width=6,height=4)
+ggplot(enrich, aes(x = cell_type, y = log2OR)) +geom_hline(yintercept=0, color="grey", lty="dashed")+
+  geom_bar(stat="identity",aes(fill=cell_type)) +
+  geom_errorbar(aes(ymin = log2_lower, ymax = log2_upper), width=0.2) +
+  geom_text(aes(label = sig, y = 1.2)) +
+  labs(x = "Cell type", y = "Log2FE",       title = "Cell type enrichment for Human-lost CREs") +
+  theme_classic()+scale_fill_manual(values=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1", "Shared"="grey25", "Neuronal"="blue"))+theme(axis.text.x=element_text(angle=90))
+dev.off()
+
+```
+
+
+## GO enrichment
+```{r, eval=F}
+
+
+LINKS2<-LINKS[which(LINKS$HumanLost==T & LINKS2$Num_species>4),]
+
+dbs <- c("GO_Molecular_Function_2025", "GO_Cellular_Component_2025", "GO_Biological_Process_2025", "KEGG_2025_Human","Jensen_DISEASES_Experimental_2025")
+
+tab<-table(LINKS2$specificity_ct)
+GO<-list()
+for(i in names(tab[tab>50])){
+  GO[[i]]<-enrichr(unique(LINKS2[which( LINKS2$specificity_ct==i ),]$gene), dbs)[["GO_Biological_Process_2025"]]
+       GO[[i]]$ct<-i            
+}
+
+
+GO.m<-do.call(rbind, GO)
+
+sig<-GO.m[which(GO.m$Adjusted.P.value<0.05),]
+top<-sig %>% group_by(ct) %>% top_n(n=3, wt=Combined.Score)
+terms<-top$Term
+
+MAT<-matrix(nrow=length(unique(terms)), ncol=length(tab[tab>50]))
+rownames(MAT)<-unique(terms)
+colnames(MAT)<-names(tab[tab>50])
+for(i in unique(terms)){
+  for(j in names(tab[tab>50])){
+    val<-GO.m[which(GO.m$Term==i & GO.m$ct==j),]$Combined.Score
+    if(length(val)>0){
+      MAT[i,j]<- val} 
+    else{
+      MAT[i,j]<- 0 }}}
+
+ha<-HeatmapAnnotation(celltype=colnames(MAT),
+                      col=list(
+                      celltype=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1", "Shared"="grey20","Neuronal"="blue")))
+
+pdf("Heatmap_GO-enrich_Human-Loss_byCT.pdf", width=12,height=8)
+Heatmap(log10(MAT+1), name= "log10(enrichR)",col=colorRamp2( c(0,0.5,1.5,2.5), plasma(4)), cluster_columns=F,top_annotation=ha, column_split=sapply(strsplit(colnames(MAT),"-"),`[`,2), row_km=3,row_names_max_width= max_text_width(
+        rownames(MAT),      gp = gpar(fontsize = 14)))
+dev.off()
+
+```
+
+
+
+```{r, eval=F}
+data<-readRDS("~/scAnalysis/NPC_multi/210330_filtered_multi.rds")
+DefaultAssay(data)<-"ATAC"
+phast <- import("~/cross_species/external_data/hg38.phastConsElements470way.bed", which=peaks.import)
+
+
+
+region<-GRanges(paste0("chr1:",min(start(LINKS2[which(LINKS2$gene=="SRGAP2"),]))-10000, "-", max(end(LINKS2[which(LINKS2$gene=="SRGAP2"),]))+10000))
+
+
+# PEAK plot
+p1<-Bed_PeakPlot(LINKS2[which(LINKS2$gene=="SRGAP2" & LINKS2$num_species>2 &LINKS2$group.y=="human-lost"),], region, group.by="F_name")+ theme(legend.position="none")+scale_color_manual(values=c("R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R2.5"= "#00BFC4","R3"= "#619CFF","R4"= "#F564E3")) +ylab("Human-lost")
+p2<-Bed_PeakPlot(LINKS2[which(LINKS2$gene=="SRGAP2" & LINKS2$num_species>2 &LINKS2$group.y!="human-lost"),], region, group.by="F_name")+ theme(legend.position="top")+scale_color_manual(values=c("R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R2.5"= "#00BFC4","R3"= "#619CFF","R4"= "#F564E3")) + ylab("other")
+
+p3<-Bed_PeakPlot(phast, region)+ylab("phastCons Element")
+# ENCODE cCRE plot
+CRE<-Bed_PeakPlot(enc4, region, group.by="cCRE")+ylab("cCREs")+scale_color_manual(values=c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me3"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen","None"="grey"))+theme(legend.position="none")
+# phyloP plot
+phyloP<-BigwigTrack(region, "cross_species/external_data/cactus241way.phyloP.bw", smooth=50)+scale_fill_manual(values="midnightblue")+ylim(-2,5)+ylab("phyloP")+theme(legend.position="none")
+# gene annotation plot
+genes<-AnnotationPlot(data, region)
+
+p<-CombineTracks(plotlist=list(p2,p1,genes,CRE,phyloP,p3),heights=c(1,1,4,2,1))
+pdf("SRGAP2_region.pdf", width=5,height=4)
+p
+dev.off()
+```
+
+
+
+## PhastCons
+```{r, eval=F}
+
+df<-data.frame(prop.table(table(HL$cCRE_class)))
+pdf("AndrewsAnnot_HL.pdf")
+ggplot(df, aes(x=Freq,y="Var1", fill=Var1))+geom_bar(stat="identity")+theme_classic()
+dev.off()
+
+PEAKS.rd$HL2<-ifelse(PEAKS.rd$HumanLost==T, "HL", PEAKS.rd$F_mod)
+pdf("phastCons_HL.pdf", width=5,height=4)
+ggplot(as.data.frame(PEAKS.rd), aes(y=phast_max, fill=HL2, x=HL2))+geom_boxplot()+theme_classic()+stat_compare_means(method="t.test", comparisons=list(c("HL","R4"), c("HL","R3")))+scale_fill_manual(values=c(
+"R0"= "#F8766D","R1"= "#B79R00","R2"= "#00BA38","R3"= "#619CFF","R4"= "#F564E3", "HL"="#ff353b"))
+dev.off()
+
+df<-data.frame(prop.table(table(HL$ZF)))
+pdf("ZF_HL.pdf")
+ggplot(df, aes(x=Freq,y="Var1", fill=Var1))+geom_bar(stat="identity")+theme_classic()
+dev.off()
+
+
+t.test(phast_max~HumanLost, PEAKS.rd[which(PEAKS.rd$F_mod == "R3" | PEAKS.rd$HumanLost==T),])
+```
+
+
+
+# Functional Validation
+
+## MPRA
+```{r, eval=F}
+
+Neuron<-read.table("/cluster/projects/Cross_Species/MPRA/CrossSpeciesNeuronMPRA/output_analysis/MPRAflow/output/Neuron/testEmpirical_alpha_Neuron_results_labeled.tsv")
+Neuron<-Neuron[!(grepl("scramble",Neuron$label)),]
+Neuron.gr<-GRanges(Neuron$label)
+Neuron.gr<-resize(Neuron.gr, width=270, fix="start")
+mcols(Neuron.gr)<-Neuron
+
+NPC<-read.table("/cluster/projects/Cross_Species/MPRA/HEK_NPC/output_analysis/MPRAflow/output/KOLF_NPC/testEmpirical_alpha_KOLF_NPC_results_labeled.tsv")
+NPC<-NPC[!(grepl("scramble",NPC$label)),]
+NPC.gr<-GRanges(NPC$label)
+NPC.gr<-resize(NPC.gr, width=270, fix="start")
+mcols(NPC.gr)<-NPC
+
+
+HEK<-read.table("/cluster/projects/Cross_Species/MPRA/HEK_NPC/output_analysis/MPRAflow/output/HEK293FT/testEmpirical_alpha_HEK293FT_results_labeled.tsv")
+HEK<-HEK[!(grepl("scramble",HEK$label)),]
+HEK.gr<-GRanges(HEK$label)
+HEK.gr<-resize(HEK.gr, width=270, fix="start")
+mcols(HEK.gr)<-HEK
+
+
+##################
+# rename column before merging
+colnames(Neuron)[1:7]<-paste0("Neuron.",colnames(Neuron)[1:7])
+colnames(NPC)[1:7]<-paste0("NPC.",colnames(NPC)[1:7])
+colnames(HEK)[1:7]<-paste0("HEK.",colnames(HEK)[1:7])
+
+
+# merge on label
+MPRA<-merge(Neuron, NPC, by="label", all=T)
+MPRA<-merge(MPRA, HEK, by="label", all=T)
+MPRA.gr<-GRanges(MPRA$label)
+MPRA.gr<-resize(MPRA.gr, width=270, fix="start")
+mcols(MPRA.gr)<-MPRA
+
+ol<-findOverlaps(MPRA.gr, PEAKS.rd)
+MPRA.gr$index<-NA
+MPRA.gr[queryHits(ol)]$index<-PEAKS.rd[subjectHits(ol)]$index
+
+saveRDS(MPRA.gr, "~/cross_species/MPRA_merged_results.rds")
+write.csv(MPRA.gr, "~/cross_species/SuppTable_MPRA_merged_results.csv", row.names=F)
+
+# Plot Neuron vs NPC
+p1 <- ggplot(MPRA, aes(y = log2(NPC.statistic), x = log2(Neuron.statistic))) +
+  geom_point(alpha = 0.2, color = "steelblue1") +
+  geom_smooth(method = "lm", se = FALSE, color = "steelblue4", extend=T) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top" ,color = "steelblue4") +
+  labs(title = "Enhancer Activity: Neuron vs NPC",
+       y = "NPC alpha",
+       x = "Neuron alpha") +xlim(-2,2.5)+ylim(-1,4)+
+  theme_classic()
+
+# Plot Neuron vs HEK
+p2 <- ggplot(MPRA, aes(y = log2(HEK.statistic), x = log2(Neuron.statistic))) +
+  geom_point(alpha = 0.2, color = "orange1") +
+  geom_smooth(method = "lm", se = FALSE, color = "darkorange", extend=T) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", color = "darkorange") +
+  labs(title = "Enhancer Activity: Neuron vs HEK",
+       y = "HEK alpha",
+       x = "Neuron alpha") +xlim(-2,2.5)+ylim(-1,4)+
+  theme_classic()
+
+
+
+pdf("CorPlot_MPRA-alpha_Neuron_v_HEK-NPC.pdf", width=7,height=4)
+plot_grid(p1,p2)
+dev.off()
+
+
+PEAKS.rd$Neuron_MPRA_sig<-as.numeric(PEAKS.rd$Neuron_MPRA_sig)
+PEAKS.rd$NPC_MPRA_sig<-as.numeric(PEAKS.rd$NPC_MPRA_sig)
+PEAKS.rd$HEK_MPRA_sig<-as.numeric(PEAKS.rd$HEK_MPRA_sig)
+
+
+cs<-rowSums(as.matrix(mcols(subsetByOverlaps(PEAKS.rd, MPRA.gr))[,c(17,39,40)]))
+
+pdf("MPRA_activity_by_sig.pdf")
+p1<-ggplot(as.data.frame(Neuron.gr), aes(x=sig, y=mad.score, fill=sig))+geom_violin()+scale_fill_manual(values=c("grey90","blue"))+theme_classic()+theme(legend.position="none")+ggtitle("Neuron")+ylim(-10,20)
+p2<-ggplot(as.data.frame(NPC.gr), aes(x=sig, y=mad.score, fill=sig))+geom_violin()+scale_fill_manual(values=c("grey90","steelblue1"))+theme_classic()+theme(legend.position="none")+ggtitle("NPC")+ylim(-10,20)
+p3<-ggplot(as.data.frame(HEK.gr), aes(x=sig, y=mad.score, fill=sig))+geom_violin()+scale_fill_manual(values=c("grey90","orange1"))+theme_classic()+theme(legend.position="none")+ggtitle("HEK293FT")+ylim(-10,20)
+plot_grid(p1,p2,p3,nrow=1)
+dev.off()
+```
+
+### signal: cons vs human-spec
+```{r, eval=F}
+###
+# z-score because of differences in alpha
+MPRA.gr$Neuron.alpha.z<-scale(MPRA.gr$Neuron.statistic)
+MPRA.gr$NPC.alpha.z<-scale(MPRA.gr$NPC.statistic)
+
+
+
+# NPC
+ol<-findOverlaps(PEAKS.MPRA, MPRA.gr)
+df <- data.frame(peak_index = queryHits(ol),
+  score = mcols(MPRA.gr)$NPC.alpha.z[subjectHits(ol)])
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(max_alpha = max(score, na.rm = TRUE)
+  )
+PEAKS.MPRA$NPC_signal<-NA
+PEAKS.MPRA[res$peak_index]$NPC_signal<-res$max_alpha
+# NEURON
+df <- data.frame(peak_index = queryHits(ol),
+  score = mcols(MPRA.gr)$Neuron.alpha.z[subjectHits(ol)])
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(max_alpha = max(score, na.rm = TRUE)
+  )
+PEAKS.MPRA$Neuron_signal<-NA
+PEAKS.MPRA[res$peak_index]$Neuron_signal<-res$max_alpha
+
+
+
+# melt so can have both in same plot
+melt.mpra<-melt(as.data.frame(mcols(PEAKS.MPRA)[,c(33,38,39)]))
+melt.mpra$variable<-gsub("_signal","", melt.mpra$variable)
+melt.mpra$evolution_group <- ifelse(melt.mpra$F_mod %in% c("R1", "R2"), "recent", 
+                             ifelse(melt.mpra$F_mod %in% c("R3", "R4"), "conserved", NA))
+
+pdf("Alpha_distribution_z-score_byCT.pdf", width=4,height=3)
+ggplot( as.data.frame(melt.mpra), aes(x=F_mod, y=value, fill=F_mod))+geom_boxplot(aes(color=variable))+theme_classic()+ylab("alpha")+stat_compare_means(method="anova")+ylim(-3,7)+ylab("MPRA alpha Z-score")+scale_color_manual(values=c("grey","black"))
+dev.off()
+
+```
+
+### promoter controls
+
+Notice higher signal in NPCs and HEKs versus neurons. Is this consistent for positive controls
+```{r, eval=F}
+proms<-GRanges(read.csv("~/cross_species/MPRA_promoter_control.csv"))
+
+ol<-findOverlaps(proms, MPRA.gr)
+df <- data.frame(peak_index = queryHits(ol),
+  Neuron = mcols(MPRA.gr)$Neuron.zscore[subjectHits(ol)],
+  NPC = mcols(MPRA.gr)$NPC.zscore[subjectHits(ol)],
+  HEK = mcols(MPRA.gr)$HEK.zscore[subjectHits(ol)])
+res <- df %>%
+  group_by(peak_index) %>%
+  summarise(max_neuron = max(Neuron, na.rm = TRUE),
+            max_npc = max(NPC, na.rm = TRUE),
+            max_hek = max(HEK, na.rm = TRUE)
+  )
+proms$Neuron_signal<-NA
+proms$NPC_signal<-NA
+proms$HEK_signal<-NA
+proms[res$peak_index]$Neuron_signal<-res$max_neuron
+proms[res$peak_index]$NPC_signal<-res$max_npc
+proms[res$peak_index]$HEK_signal<-res$max_hek
+
+proms.m<-melt(as.data.frame(mcols(proms)), id.vars=c("gene_name","NGN2"))
+proms.m$variable<-gsub("_signal","", proms.m$variable)
+pdf("Alpha_distribution_Promoter_controls.pdf", width=4,height=4)
+ggplot(as.data.frame(proms.m), aes(x=NGN2, y=value, color=variable))+geom_point()+geom_smooth(se=T,aes(fill=variable), method="lm")+theme_classic()+ggtitle("Promoter Controls")+xlab("NGN2 expression (CPM)")+ylab("Zscore alpha")
+dev.off()
+```
+
+
+
+### GO enrichment
+```{r, eval=F}
+
+LINKS.MPRA<-subsetByOverlaps(LINKS, MPRA.gr)
+
+LINKS.MPRA$Neuron_sig<-F
+ol<-findOverlaps(LINKS.MPRA, Neuron.gr[which(Neuron.gr$pval.empirical<0.05),])
+LINKS.MPRA[queryHits(ol),]$Neuron_sig<-T
+
+LINKS.MPRA$NPC_sig<-F
+ol<-findOverlaps(LINKS.MPRA, NPC.gr[which(NPC.gr$pval.empirical<0.05),])
+LINKS.MPRA[queryHits(ol),]$NPC_sig<-T
+
+LINKS.MPRA$HEK_sig<-F
+ol<-findOverlaps(LINKS.MPRA, HEK.gr[which(HEK.gr$pval.empirical<0.05),])
+LINKS.MPRA[queryHits(ol),]$HEK_sig<-T
+
+go_file<- "~/cross_species/external_data/GO_Biological_Process_2025.txt"
+
+neuron<-
+  unique(LINKS.MPRA[which(LINKS.MPRA$Neuron_sig==T & LINKS.MPRA$NPC_sig==F & LINKS.MPRA$T_level>0),]$gene) #165
+npc<-
+  unique(LINKS.MPRA[which(LINKS.MPRA$Neuron_sig==F & LINKS.MPRA$NPC_sig==T & LINKS.MPRA$T_level>0),]$gene) #152
+# 19 shared
+# your custom background/universe:
+bgGenes<- unique(LINKS.MPRA[which(LINKS.MPRA$T_level>0),]$gene) #624
+
+
+###############################################
+################  FUNCTION  ###################
+enrichr_custom_bg <- function(term_genes, bg_genes, go_file) {
+  # read & parse GO library
+  lines       <- readLines(go_file)
+  parsed      <- strsplit(lines, "\t")
+  go_terms    <- sapply(parsed, `[`, 1)
+  go_geneSets <- lapply(parsed, function(x) x[-1][x[-1] != ""])
+  
+  M <- length(bg_genes)   # universe size
+  N <- length(term_genes) # study set size
+  
+  # preallocate results
+  results <- data.frame(
+    Term            = go_terms,
+    TermSize        = integer(length(go_terms)),
+    Overlap         = integer(length(go_terms)),
+    OverlapGenes    = character(length(go_terms)),
+    HG.P.value      = numeric(length(go_terms)),
+    HG.OddsRatio    = numeric(length(go_terms)),
+    Fisher.P.value  = numeric(length(go_terms)),
+    Fisher.OddsRatio= numeric(length(go_terms)),
+    stringsAsFactors = FALSE
+  )
+  
+  for(i in seq_along(go_terms)) {
+    # restrict GO term to your universe, and find overlap
+    term_set <- intersect(go_geneSets[[i]], bg_genes)
+    hits     <- intersect(term_genes, term_set)
+    
+    n <- length(term_set)     # term size in universe
+    k <- length(hits)         # overlap count
+    
+    # --- hypergeometric test ---
+    hg_p  <- phyper(k - 1, n, M - n, N, lower.tail = FALSE)
+    # manual OR = (k * (M - n - N + k)) / ((N - k)*(n - k))
+    a <- k
+    b <- N - k
+    c <- n - k
+    d <- M - n - (N - k)
+    # Haldane pseudocount
+    a2 <- a + 0.5; b2 <- b + 0.5; c2 <- c + 0.5; d2 <- d + 0.5
+    hg_or <- (a2 * d2) / (b2 * c2)
+
+    
+    # --- Fisher's exact test (one-sided 'greater') ---
+    # contingency table:
+    #         in term    not in term
+    # in set     k          N - k
+    # not set   n - k    M - n - (N - k)
+    ct <- matrix(c(
+      k,
+      N - k,
+      n - k,
+      M - n - N + k
+    ), nrow = 2,
+    dimnames = list(
+      Study = c("InTerm", "NotInTerm"),
+      Universe = c("InSet", "NotInSet")
+    ))
+    ft <- fisher.test(ct, alternative = "greater")
+    
+    # fill results
+    results$TermSize[i]         <- n
+    results$Overlap[i]          <- k
+    results$OverlapGenes[i]     <- paste(hits, collapse = ",")
+    results$HG.P.value[i]       <- hg_p
+    results$HG.OddsRatio[i]     <- hg_or
+    results$Fisher.P.value[i]   <- ft$p.value
+    results$Fisher.OddsRatio[i] <- unname(ft$estimate)
+  }
+  
+  # adjust hypergeometric p‑values; you could also adjust Fisher’s if desired
+  results$HG.adj.P.value    <- p.adjust(results$HG.P.value, method = "BH")
+  results$Fisher.adj.P.value<- p.adjust(results$Fisher.P.value, method = "BH")
+  
+  # sort by hypergeometric adjusted p‑value (or choose Fisher)
+  results <- results[order(results$HG.adj.P.value, results$HG.P.value), ]
+  rownames(results) <- NULL
+  return(results)
+}
+###############################################
+
+results_neuron <-enrichr_custom_bg(neuron, bgGenes, go_file)
+results_npc <-enrichr_custom_bg(npc, bgGenes, go_file)
+results_neuron$celltype="neuron"
+results_npc$celltype="npc"
+
+keep<-results_neuron[which(results_neuron$HG.P.value<0.05 & results_neuron$TermSize>5),]
+top<-rbind(keep,results_npc[which(results_npc$HG.P.value<0.05 & results_npc$TermSize>5),])
+top<-top[!(top$Term %in% c("Peptidyl–Tyrosine Phosphorylation (GO:0018108)","Regulation of Heart Contraction (GO:0008016)", "Sensory Perception of Mechanical Stimulus (GO:0050954)", "Sensory Perception of Sound (GO:0007605)", "T Cell Receptor Signaling Pathway (GO:0050852)", "Regulation of Angiogenesis (GO:0045765)
+", "Cell Surface Receptor Protein Tyrosine Kinase Signaling Pathway (GO:0007169)", "Brain Development (GO:0007420)")),]
+top<-rbind(top, results_npc[1,])
+
+GO<-rbind(results_neuron, results_npc)
+
+MAT<-matrix(nrow=length(unique(top$Term)), ncol=2)
+rownames(MAT)<-unique(top$Term)
+colnames(MAT)<-c("neuron","npc")
+for(i in unique(top$Term)){
+  for(j in colnames(MAT)){
+    #val<-GO[which(GO$Term==i & GO$celltype==j),]$HG.P.value
+    val<-GO[which(GO$Term==i & GO$celltype==j),]$HG.OddsRatio
+    if(length(val)>0){
+      #MAT[i,j]<- -log10(val)} 
+      MAT[i,j]<- val}
+    else{
+      MAT[i,j]<- 0 }}}
+
+split<-rownames(MAT) %in% keep$Term
+pdf("Heatmap_GO-enrich-CUSTOM_MPRA-sig_celltype-ignoreHEK.pdf", width=10,height=6)
+Heatmap(MAT, name= "OR",col=colorRamp2( c(1.5,3,6,8), viridis(4)), cluster_columns=F, row_names_max_width= max_text_width(
+        rownames(MAT),      gp = gpar(fontsize = 25)), row_split=split)
+dev.off()
+
+
+
+
+
+
+
+
+################
+# split conserved vs new
+
+spec<-
+  unique(LINKS.MPRA[which( LINKS.MPRA$F_mod %in% c("R1","R2") & (LINKS.MPRA$Neuron_sig==T | LINKS.MPRA$NPC_sig==T) & LINKS.MPRA$T_level>0),]$gene) #86
+cons<-
+  unique(LINKS.MPRA[which( LINKS.MPRA$F_mod %in% c("R3","R4") & (LINKS.MPRA$Neuron_sig==T | LINKS.MPRA$NPC_sig==T) & LINKS.MPRA$T_level>0),]$gene) #460
+# 4 shared
+# your custom background/universe:
+bgGenes<- unique(LINKS.MPRA[which(LINKS.MPRA$T_level>0),]$gene) #624
+
+
+results_spec <-enrichr_custom_bg(spec, bgGenes, go_file)
+results_cons <-enrichr_custom_bg(cons, bgGenes, go_file)
+results_spec$celltype="spec"
+results_cons$celltype="cons"
+
+keep<-results_spec[which(results_spec$HG.P.value<0.05 & results_spec$TermSize>5),]
+top<-rbind(keep,results_cons[which(results_cons$HG.P.value<0.05 & results_cons$TermSize>5),])
+top<-top[!(top$Term %in% c("Peptidyl–Tyrosine Phosphorylation (GO:0018108)","Regulation of Heart Contraction (GO:0008016)", "Sensory Perception of Mechanical Stimulus (GO:0050954)", "Sensory Perception of Sound (GO:0007605)", "T Cell Receptor Signaling Pathway (GO:0050852)")),]
+top<-rbind(top, results_cons[1,])
+
+GO<-rbind(results_spec, results_cons)
+
+MAT<-matrix(nrow=length(unique(top$Term)), ncol=2)
+rownames(MAT)<-unique(top$Term)
+colnames(MAT)<-c("spec","cons")
+for(i in unique(top$Term)){
+  for(j in colnames(MAT)){
+    #val<-GO[which(GO$Term==i & GO$celltype==j),]$HG.P.value
+    val<-GO[which(GO$Term==i & GO$celltype==j),]$HG.OddsRatio
+    if(length(val)>0){
+      #MAT[i,j]<- -log10(val)} 
+      MAT[i,j]<- val}
+    else{
+      MAT[i,j]<- 0 }}}
+
+split<-rownames(MAT) %in% keep$Term
+pdf("Heatmap_GO-enrich-CUSTOM_MPRA-sig_spec-cons-ignoreHEK.pdf", width=10,height=6)
+Heatmap(MAT, name= "OR",col=colorRamp2( c(0,3,6,8), plasma(4)), cluster_columns=F, row_names_max_width= max_text_width(
+        rownames(MAT),      gp = gpar(fontsize = 25)), row_split=split)
+dev.off()
+
+```
+
+
+## CRIPSRi
+
+### DESeq2
+```{r, eval=F}
+counts<-read.csv("/cluster/projects/Cross_Species/CRISPRi/combinedcounts.csv", row.names=1)
+ss<-read.csv("/cluster/projects/Cross_Species/CRISPRi/CrossSpeciesCRISPRiMasterSampleSheet_07222024_BBR.csv")
+
+counts<-counts[,ss$Sample]
+
+obj<-CreateSeuratObject(counts)
+obj<-NormalizeData(obj)
+obj<-AddModuleScore(obj, features=list(c("LIN28A","NES")), name="Immature_score", search=T)
+obj<-AddModuleScore(obj, features=list(c("CACNA1C","ENO2","MAP2")), name="Mature_score")
+obj<-AddModuleScore(obj, features=list(c("AQP4", "SLC1A3")), name="Astrocyte_score")
+
+
+ss$Immature_score<-obj$Immature_score1
+ss$Mature_score<-obj$Mature_score1
+ss$Astrocyte_score<-obj$Astrocyte_score1
+
+
+ss$gRNA<-ifelse(ss$TargetRegion=="SafeHarbor", "Ctrl",ss$gRNA_name)
+
+dds<-DESeqDataSetFromMatrix(countData=counts, colData=ss, design=~TargetRegion+Immature_score+Astrocyte_score)
+dds<-DESeq(dds)
+res <- results(dds, contrast=c("TargetRegion","chr8_22056493","SafeHarbor"))
+
+tab<-table(ss[which(ss$TargetRegion != "SafeHarbor" ),]$TargetRegion)
+
+RES<-list()
+for( i in names(tab)){
+  res<- results(dds, contrast=c("TargetRegion",i,"SafeHarbor"))
+  res$gene<-rownames(res)
+  res$gRNA<-i
+  RES[i]<-res
+}
+
+names(RES)<-NULL
+all_results<-do.call(rbind,RES)
+all_results$seqnames<-sapply(strsplit(all_results$gRNA,"_"),`[`,1)
+all_results$start<-sapply(strsplit(all_results$gRNA,"_"),`[`,2)
+all_results$end<-as.numeric(all_results$start)+2000
+all_results<-GRanges(all_results)
+
+saveRDS(all_results,"~/cross_species/CRISPRi_AQP4-SLC1A3_CACNA1C-ENO2-MAP2.rds")
+```
+
+
+
+
+#### Volcano
+```{r, eval=F}
+
+
+CRISPR<-readRDS("~/cross_species/CRISPRi_AQP4-SLC1A3_CACNA1C-ENO2-MAP2.rds")
+# add linked gene
+ol<-findOverlaps(CRISPR, LINKS)
+CRISPR2<-CRISPR[queryHits(ol)]
+CRISPR2$linked_gene<-NA
+CRISPR2$linked_gene<-LINKS[subjectHits(ol)]$gene
+# add peak index
+ol<-findOverlaps(CRISPR2, PEAKS.rd)
+CRISPR2$index<-NA
+CRISPR2[queryHits(ol)]$index<-PEAKS.rd[subjectHits(ol)]$index
+keep<-subsetByOverlaps( gtf_gene,CRISPR2, maxgap=200000) #find all overlaps within 1Mb
+CRISPR2<-CRISPR2[which(CRISPR2$gene %in% keep$gene_name),]
+#################################
+gene_coords <- GRanges(
+  seqnames = seqnames(gtf_gene),
+  ranges   = ranges(gtf_gene),
+  strand   = strand(gtf_gene),
+  gene_name = mcols(gtf_gene)$gene_name
+)
+names(gene_coords) <- mcols(gtf_gene)$gene_name  # allow lookup by name
+
+within_200kb <- function(region, gene_id, gene_coord_map) {
+  idx <- which(names(gene_coord_map) == gene_id)
+  if (length(idx) == 0) return(FALSE)
+  # Use only the first matching gene
+  gene_gr <- gene_coord_map[idx[1]]
+  # Check same chromosome
+  if (as.character(seqnames(region)) != as.character(seqnames(gene_gr))) return(FALSE)
+  # Compute distance
+  dist <- distance(region, gene_gr)
+  return(!is.na(dist) && dist <= 200000)
+}
+#################################
+
+keep_idx <- vapply(seq_along(CRISPR2), function(i) {
+  within_200kb(CRISPR2[i], CRISPR2$gene[i], gene_coords)
+}, logical(1))
+
+CRISPR.link <- CRISPR2[keep_idx]
+
+
+CRISPR.link$link<-CRISPR.link$gene==CRISPR.link$linked_gene
+CRISPR.link$color2<-factor(ifelse(CRISPR.link$padj<0.05,CRISPR.link$gRNA, NA))
+CRISPR.link$padj2<-ifelse(CRISPR.link$padj<1e-14, 1e-14, CRISPR.link$padj)
+write.csv(CRISPR.link[!(duplicated(CRISPR.link$uniq)),], "~/cross_species/SuppTable10_CRISPRi_results_within200kb.csv", row.names=F)
+#remove dups from multi TSS
+CRISPR.link$uniq<-paste0(CRISPR.link$gene, "-", CRISPR.link$gRNA)
+CRISPR.link2<-CRISPR.link[!(duplicated(CRISPR.link$uniq)),]
+CRISPR.link2$type<-ifelse(CRISPR.link2$gRNA %in% ss[which(ss$Type=="Promoter"),]$TargetRegion, "Promoter","Link")
+names(CRISPR.link2)<-NULL
+
+pdf("CRISPRi_linked_genes_VolcanoPlot_DESeq2-Rerun2.pdf", width=4, height=4)
+ggplot(as.data.frame(CRISPR.link2), aes(x=log2FoldChange, y= -log10(padj2), color=color2, shape=link, alpha=link))+theme_classic()+ylab("-log10(FDR)")+xlim(-8,2)+
+  geom_vline(xintercept=0, lty="dashed",alpha=0.5,color="grey")+ geom_hline(yintercept= -log10(0.05), lty="dashed",alpha=0.5,color="grey")+
+  theme(legend.position="none")+  ggtitle("CRISPRi")+
+  scale_shape_manual(values=c(1,19))+
+  scale_alpha_manual(values=c(0.7,1))+
+  geom_text_repel(data=as.data.frame(CRISPR.link2[which( CRISPR.link2$padj<0.05),]), size=4,color="grey30",aes(label=gene), min.segment.length = unit(0, 'lines'))+geom_point()
+dev.off()
+```
+
+
+
+### Region plot (FAM181B)
+```{r, eval=F}
+r1<-LINKS[which(LINKS$index=="473013"),]
+
+region<-GRanges(paste0("chr11:",min(start(LINKS.signac[which(LINKS.signac$index=="473013"),]))-5000, "-", max(end(LINKS.signac[which(LINKS.signac$index=="473013"),]))+5000))
+
+cp<-CoveragePlot(data,window=500,region,idents=c("Oligodendrocytes","OPCs","Astrocytes", "Microglia","Excitatory", "Inhibitory" ), ranges=mpra, peaks=F, links=F, annotation=F)& scale_fill_manual(values=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1"))
+lp<-LinkPlot.height(test, region)
+
+CRE<-Bed_PeakPlot(enc4, region, group.by="cCRE")+ylab("cCREs")+scale_color_manual(values=c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me3"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen","None"="grey"))+theme(legend.position="none")
+
+phyloP<-BigwigTrack(region, "cross_species/external_data/cactus241way.phyloP.bw",
+                    smooth=200)+scale_fill_manual(values="midnightblue")+ylim(-2,8)+ylab("phyloP")+theme(legend.position="none")
+phastCons<-Bed_PeakPlot(phast, region)
+
+genes<-AnnotationPlot(data, region)
+HUMAN.plot<-CombineTracks(plotlist=list(cp,lp,genes,CRE,phastCons,phyloP),heights=c(6,2,2,1,1,1))
+
+pdf("FAM181B_linkPlot.pdf")
+HUMAN.plot
+dev.off()
+
+pdf("FAM181B_linkPlot_phyloP.pdf", width=8, height=2)
+phyloP
+dev.off()
+
+#####################################
+
+mpra<-GRanges("chr11:82756409-82758308")
+mpra<-resize(mpra, width=2300, fix="start")
+
+gRNA<-Bed_GWASPlot(ss.gr, mpra)
+
+p1<-Pileup(peaks[which(peaks$type=="NEUN"),], mpra)+scale_color_manual(values="cornflowerblue")+ylab("NEUN")
+p2<-Pileup(peaks[which(peaks$type=="NEG"),], mpra)+scale_color_manual(values="mediumorchid2")+ylab("NEG")+ylim(0,30)
+p3<-Pileup(peaks[which(peaks$type=="OLIG"),], mpra)+scale_color_manual(values="coral3")+ylab("OLIG")+ylim(0,56)
+
+
+m1<-MPRA_Plot(Neuron.gr, mpra) +ylab("Neuron")+ylim(0,3)+scale_color_manual(values="#377EB8")
+m2<-MPRA_Plot(NPC.gr, mpra) +ylab("NPC")+ylim(0,3)+scale_fill_manual(values="#4DAR4A")
+m3<-MPRA_Plot(HEK.gr, mpra) +ylab("HEK293")+scale_fill_manual(values="#R17356")
+
+
+
+CRE<-Bed_PeakPlot(enc4, mpra, group.by="cCRE")+ylab("cCREs")+scale_color_manual(values=c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me3"="pink","CA-CTCF"= "royalblue", "CA"="green4", "TF"="seagreen3","CA-TF"="darkgreen","None"="grey"))+theme(legend.position="none")
+
+phyloP<-BigwigTrack(mpra, "cross_species/external_data/cactus241way.phyloP.bw",
+                    smooth=2)+scale_fill_manual(values="midnightblue")+ylim(-2,8)+ylab("phyloP")+theme(legend.position="none")
+phastCons<-Bed_PeakPlot(phast, mpra)
+
+HUMAN.plot<-CombineTracks(plotlist=list(m1,m2,m3,p1,p2,p3,gRNA,CRE,phastCons,phyloP),heights=c(3,3,3,3,3,3,1,1,1,3))
+
+pdf("FAM181B_linkPlot-ZOOM.pdf", width=6,height=5)
+HUMAN.plot
+dev.off()
+
+```
+
+#### boxplots
+```{r, eval=F}
+counts<-read.csv("/cluster/projects/Cross_Species/CRISPRi/combinedcounts.csv", row.names=1)
+ss<-read.csv("/cluster/projects/Cross_Species/CRISPRi/CrossSpeciesCRISPRiMasterSampleSheet_07222024_BBR.csv")
+
+cpm<-cpm(counts)
+cpm<-cpm[,ss$Sample]
+gene<-"NRGN"
+ss$Exp<-as.numeric(as.list(cpm[gene,]))
+
+gene2<-"NRGN"
+link<-unique(ss[grepl(gene2, ss$ConservedTargetGene) & ss$Type=="Link",]$TargetRegion)
+prom<-unique(ss[grepl(gene2, ss$ConservedTargetGene) & ss$Type=="Promoter",]$TargetRegion)
+keep<-unique(ss[grepl(gene2, ss$ConservedTargetGene) & ss$Type=="Link",]$Expt)
+tmp<-ss[which(ss$TargetRegion %in% c("SafeHarbor",link, prom) & ss$Expt %in% keep ),]     
+tmp$Type<-factor(tmp$Type, levels=c("Control","Promoter","Link"))
+
+
+mycomp=list(c("Control","Link"),c("Control","Promoter"))
+
+pdf(paste0("",gene,"_boxplot_Ctrls_Promoter.pdf"), width=3,height=3)
+ggplot(tmp, aes(x=Type, y=Exp))+geom_boxplot(aes(fill=Type), position = position_dodge(0.7), width=0.7, color="black", outlier.shape=NA)+theme_classic()+geom_jitter(width=0.2, height=0, alpha=0.5)+stat_compare_means(method="t.test", comparisons=mycomp)+ggtitle(gene)+ theme(plot.title = element_text(hjust = 0.5), legend.position="none")+scale_fill_manual(values=c("grey30","darkslategray4", "darkslategray1"))+ylab("CPM")+ylim(0,max(tmp$Exp)*1.5)
+dev.off()
+
+```
+
+# Disease Association
+
+## LDSC
+
+
+```{r, eval=F}
+
+F_levels<-unique(PEAKS.rd$F_mod)[-2] #remove non-human
+celltype<-unique(PEAKS.rd$specificity_ct)[-c(6,7,9)]
+
+bad.gr<-import("~/Cochran/LDSC/Remove_SNPs.bed", format="bed") #list of SNPs from hg19 that liftover to the same position in hg38 causing duplicate rsIDs
+
+
+for(ct in celltype){
+  for(f in F_levels){
+    tmp<-PEAKS.rd[which(PEAKS.rd$F_mod==f & PEAKS.rd$specificity_ct==ct),]
+    tmp<-as.data.frame(subsetByOverlaps(tmp, bad.gr, invert=T))[,1:3]
+    write.table(tmp, paste0("cross_species/LDSC_F-T_celltype/input/",f,"_", ct,".bed"), quote=F, row.names=F, col.names=F, sep="\t")
+  }
+}
+
+
+LINKS$T_mod<-ifelse(LINKS$T_mod=="T4","T3",LINKS$T_mod)
+T_levels<-unique(LINKS$T_mod)[-1] #remove non-human
+
+for(ct in celltype){
+  for(f in T_levels){
+    tmp<-LINKS[which(LINKS$T_mod==f & LINKS$specificity_ct==ct),]
+    tmp<-as.data.frame(subsetByOverlaps(tmp, bad.gr, invert=T))[,1:3]
+    write.table(tmp, paste0("cross_species/LDSC_F-T_celltype/input/",f,"_", ct,".bed"), quote=F, row.names=F, col.names=F, sep="\t")
+  }
+}
+
+```
+
+### LDSC_Analysis20.sh
+script to generate initial files
+```{bash, eval=F}
+#!/bin/bash
+
+export MKL_NUM_THREADS=8
+
+BED=$1
+#BIMFILE=$2
+INPUT_BED=$2
+OUTPUT_DIR=$3
+BIM_DIR=$4
+samp=$5
+#CHR=$7
+GWAS=$6
+
+study=`basename ${GWAS} | cut -d "." -f1`
+RESULTS_DIR="cross_species/LDSC_F-T_celltype/results"
+
+for CHR in {1..22};do
+BIMFILE=${BIM_DIR}/1000G.EUR.hg38.${CHR}.bim
+
+python LDscore/scripts/make_annot.py --bed-file ${BED} --bimfile ${BIMFILE} --annot-file ${OUTPUT_DIR}/${samp}.${CHR}.annot.gz &>cross_species/LDSC_F-T_celltype/tmp/${samp}.${CHR}.annotlog
+
+
+
+python LDscore/scripts/ldsc.py --l2 --bfile ${BIM_DIR}/1000G.EUR.hg38.${CHR} --ld-wind-cm 1 --annot ${OUTPUT_DIR}/${samp}.${CHR}.annot.gz --thin-annot --out ${OUTPUT_DIR}/${samp}.${CHR} \
+--print-snps cross_species/LDSC/print_snps.txt &>cross_species/LDSC_F-T_celltype/tmp/${samp}.${CHR}.ldsclog
+done
+
+
+python LDscore/scripts/ldsc.py --h2 ${GWAS} --w-ld-chr LDscore/LDscore_GRCh38/weights/weights.hm3_noMHC. --ref-ld-chr ${OUTPUT_DIR}/${samp}.,LDscore/LDscore_GRCh38/baselineLD_v2.2/baselineLD. --overlap-annot --frqfile-chr LDscore/1000G_Phase3_frq/1000G.EUR.QC. --out ${RESULTS_DIR}/${samp}_${study}.GWAS --print-coefficients &>cross_species/LDSC_F-T_celltype/tmp/${samp}.baseline.ldsclog
+
+```
+
+
+### LDSC_Analysis21.sh
+script to run for many GWAS sum stats
+```{bash, eval=F}
+#!/bin/bash
+
+export MKL_NUM_THREADS=8
+
+BED=$1
+#BIMFILE=$2
+INPUT_BED=$2
+OUTPUT_DIR=$3
+#BIM_DIR=$4
+samp=$4
+#CHR=$7
+GWAS=$5
+
+
+study=`basename ${GWAS} | cut -d "." -f1`
+RESULTS_DIR="cross_species/LDSC_F-T_celltype/results"
+
+python LDscore/scripts/ldsc.py --h2 ${GWAS} --w-ld-chr LDscore/LDscore_GRCh38/weights/weights.hm3_noMHC. --ref-ld-chr ${OUTPUT_DIR}/${samp}.,LDscore/LDscore_GRCh38/baselineLD_v2.2/baselineLD. --overlap-annot --frqfile-chr LDscore/1000G_Phase3_frq/1000G.EUR.QC. --out ${RESULTS_DIR}/${samp}_${study}.GWAS --print-coefficients &>cross_species/LDSC_F-T_celltype/tmp/${samp}.baseline.ldsclog
+
+```
+
+
+### sbatch_LDSC20.sh
+```{bash, eval=F}
+#!/bin/bash
+## This is to submit LDSC analysis of chr1-22 for a list of bed files
+## need input directory for bed files
+## need output dir for annot and estimates
+## need chr numbers 1-22
+## need input dir for bim file (will increase chr1 by increments in loop)
+set -e
+set -u
+
+PROGRAM=$(basename "$0")
+
+echo -e "\nYou have initialized $PROGRAM, beginning to run...\n"
+
+usage() {
+    echo "$PROGRAM USAGE:"
+    echo -e "$PROGRAM -d input_bed -o output_dir -b bim_dir\n"
+    echo -e "\t\t-d input\tThe bed input text file full path"
+    echo -e "\t\t-o output_dir\tThe output directory full path"
+    echo -e "\t\t-b bim_dir\tThe bim directory full path"
+}
+
+if [[ $# -lt 3 ]]; then
+    echo "ERROR: Not enough parameters"
+    usage
+    exit -1
+fi
+
+INPUT_BED=""
+OUTPUT_DIR=""
+BIM_DIR=""
+GWAS=""
+
+while getopts ":d:o:b:g:" optname; do
+    case "$optname" in
+    "d")
+        INPUT_BED=$OPTARG
+        ;;
+    "o")
+        OUTPUT_DIR=$OPTARG
+        ;;
+    "b")
+        BIM_DIR=$OPTARG
+        ;;
+    "g")
+        GWAS=$OPTARG
+        ;;
+    "?")
+        echo "ERROR: Unknown option $OPTARG"
+        exit -1
+        ;;
+    ":")
+        echo "ERROR: No argument value for option $OPTARG"
+        exit -1
+        ;;
+    *)
+        # Should not occur
+        echo "ERROR: Unknown error while processing options"
+        exit -1
+        ;;
+    esac
+done
+
+echo -e "Your input parameters are:"
+echo -e "INPUT_BED is:\t$INPUT_BED"
+echo -e "OUTPUT_DIR is:\t$OUTPUT_DIR"
+echo -e "BIM_DIR is:\t$BIM_DIR"
+echo -e "GWAS is:\t$GWAS"
+
+declare -a BEDFILE
+
+# Check if directories exist
+if [ ! -d "$INPUT_BED" ] || [ ! -d "$OUTPUT_DIR" ] || [ ! -d "$BIM_DIR" ]; then
+    echo "ERROR: One or more directories do not exist"
+    exit -1
+fi
+
+# Populate array with BED files
+for BED in "$INPUT_BED"/*.bed; do
+    BEDFILE+=("$BED")
+done
+
+# Loop through BED files
+for ((i = 0; i < ${#BEDFILE[@]}; i++)); do
+    samp=$(basename "${BEDFILE[i]}" .bed)
+    echo -e "SAMP is:\t$samp"
+
+    sbatch -J "annot_${samp}" -c 12 -N 1 -o "cross_species/LDSC_F-T_celltype/tmp/annot_${samp}_output.logs.txt" "cross_species/LDSC_F-T_celltype/scripts/LDSC_Analysis20.sh" "${BEDFILE[i]}" "$INPUT_BED" "$OUTPUT_DIR" "$BIM_DIR" "$samp" "$GWAS"
+done
+
+
+```
+
+
+### sbatch_Analysis21.sh
+```{bash, eval=F}
+#!/bin/bash
+## This is to submit LDSC analysis of chr1-22 for list of bedfiles
+## need input directory for bed files
+## need output dir for annot and estiamtes
+## need chr numbers 1-22
+## need input dir for bim file (will increase chr1 by increments in loop)
+set -e
+set -u
+
+PROGRAM=$(basename $0)
+
+echo -e "\nYou have initialized $PROGRAM, beginning to run...\n"
+
+usage() {
+
+    echo "$PROGRAM USAGE:"
+    echo -e "$PROGRAM -d input_bed -o output_dir -b bim_dir\n"
+    echo -e "\t\t-d input\tThe bed input text file full path"
+    #echo -e "\t\t-o output_dir\tThe output directory full path"
+    echo -e "\t\t-b bim_dir\tThe bim directory full path"
+    echo -e "\t\t-g gwas\tThe gwas directory full path"
+}
+
+if [[ $# -lt 5 ]]; then
+    echo "ERROR: Not enough parameters"
+    usage
+    exit -1
+fi
+
+INPUT_BED=""
+OUTPUT_DIR=""
+#BIM_DIR=""
+GWAS=""
+
+while getopts ":d:o:g:" optname
+  do
+  case "$optname" in
+      "d")
+          INPUT_BED=$OPTARG
+          ;;
+      "o")
+          OUTPUT_DIR=$OPTARG
+          ;;
+      "g")
+          GWAS=$OPTARG
+          ;;
+      "?")
+          echo "ERROR: Unknown option $OPTARG"
+          exit -1
+          ;;
+      ":")
+          echo "ERROR: No argument value for option $OPTARG"
+          exit -1
+          ;;
+      *)
+          # Should not occur
+          echo"ERROR: Unknown error while processing options"
+          exit -1
+          ;;
+  esac
+done
+
+echo -e "Your input parameters are:"
+echo -e "INPUT_BED is:\t$INPUT_BED"
+echo -e "OUTPUT_DIR is:\t$OUTPUT_DIR"
+#echo -e "BIM_DIR is:\t$BIM_DIR"
+echo -e "GWAS is:\t$GWAS"
+declare -a BEDFILE
+#declare -a BIMFILE
+
+# Check if directories exist
+if [ ! -d "$INPUT_BED" ] || [ ! -d "$OUTPUT_DIR" ]; then
+    echo "ERROR: One or more directories do not exist"
+    exit -1
+fi
+
+# Populate array with BED files
+for BED in "$INPUT_BED"/*.bed; do
+    BEDFILE+=("$BED")
+done
+
+# Loop through BED files
+for ((i = 0; i < ${#BEDFILE[@]}; i++)); do
+    samp=$(basename "${BEDFILE[i]}" .bed)
+    echo -e "SAMP is:\t$samp"
+
+    sbatch -J "annot_${samp}" -c 12 -N 1 -o "cross_species/LDSC_F-T_celltype/tmp/annot_${samp}_output.logs.txt" "cross_species/LDSC_F-T_celltype/scripts/LDSC_Analysis21.sh" "${BEDFILE[i]}" "$INPUT_BED" "$OUTPUT_DIR" "$samp" "$GWAS"
+done
+```
+
+
+### run LDSC
+```{bash, eval=F}
+conda activate ldsc
+
+
+sbatch -n 12 -o testlog.txt scripts/sbatch_LDSC20.sh -d cross_species/LDSC_F-T_celltype/input -b LDscore/LDscore_GRCh38/plink_files -o cross_species/LDSC_F-T_celltype/LDSC_analysis -g LDscore/GWAS_summary/AD_Kunkle_Stage1_not_APOE_HLA.sumstats.gz
+
+
+awk '{print $1 }' ../../Cochran/LDSC/path_to_sumstats.txt > use_GWAS.txt
+
+
+while IFS= read -r line; do
+    echo "Processing GWAS file: $line"
+    sbatch -n 12 -o testlog.txt scripts/sbatch_LDSC21.sh -d cross_species/LDSC_F-T_celltype/input -o cross_species/LDSC_F-T_celltype/LDSC_analysis -g ${line}
+done < use_GWAS.txt
+
+
+```
+
+
+### Merge
+```{r, eval=F}
+dir_results_data = "cross_species/LDSC_F-T_celltype/results/"
+all_partitioned_heritability_file_list =  list.files(path=dir_results_data,pattern="*.GWAS.results",full.names=T)
+
+
+#assuming tab separated values with a header    
+datalist = lapply(all_partitioned_heritability_file_list, function(x)read.table(x, header=T))
+
+for (i in 1:length(datalist)){datalist[[i]]<-cbind(datalist[[i]],all_partitioned_heritability_file_list[i])}
+
+for (i in 1:length(datalist)){datalist[[i]] <- datalist[[i]] %>%
+  mutate(Coefficient_p = pnorm(`Coefficient_z.score`, lower.tail = FALSE)) %>%
+  mutate(
+    Coefficient_holm = p.adjust(Coefficient_p, method = "holm"),
+    Enrichment_holm = p.adjust(Enrichment_p, method = "holm"),
+    Coefficient_holm_cutoff =
+      max(Coefficient_p[Coefficient_holm < 0.05], na.rm = TRUE),
+    Enrichment_holm_cutoff =
+      max(Enrichment_p[Enrichment_holm < 0.05], na.rm = TRUE)) %>%
+  mutate(sig_coef = Coefficient_holm < 0.05)}
+
+for (i in 1:length(datalist)){datalist[[i]] <- datalist[[i]] %>%
+  mutate(
+    Coefficient_BH = p.adjust(Coefficient_p, method = "BH"),
+    Enrichment_BH = p.adjust(Enrichment_p, method = "BH"),
+    Coefficient_BH_cutoff = 
+      max(Coefficient_p[Coefficient_BH < 0.05], na.rm = TRUE),
+    Enrichment_holm_cutoff =
+      max(Enrichment_p[Enrichment_BH < 0.05], na.rm = TRUE)) %>%
+  mutate(sig_coef = Coefficient_BH < 0.05)}
+
+result <- lapply(datalist, function(x) {x[1,]})
+
+#assuming the same header/columns for all files
+datafr = do.call("rbind", result)
+colnames(datafr)[11] <- "Functional_category"
+
+
+datafr$Functional_category <- gsub("cross_species/LDSC_F-T_celltype/results//", "",                                datafr$Functional_category)
+
+datafr$GWAS<-sapply(strsplit(as.character(datafr$Functional_category),"_"),`[`,3)
+datafr$GWAS<-gsub(".GWAS.results","", datafr$GWAS)
+datafr$CT<-sapply(strsplit(as.character(datafr$Functional_category),"_"),`[`,2)
+datafr$Level<-sapply(strsplit(as.character(datafr$Functional_category),"_"),`[`,1)
+datafr$Level<-paste0(datafr$Level,"-",datafr$CT)
+
+datafr <- datafr[order(datafr$Enrichment_BH),]
+```
+
+
+```{r, eval=F}
+meta<-read.csv("~/Cochran/LDSC/GWAS_files.csv")
+meta$AgeOnset<-factor(meta$AgeOnset, levels=c("Childhood","Adult","Late"))
+
+
+
+
+datafr$Coefficient_z.score<-as.numeric(datafr$Coefficient_z.score)
+datafr<-datafr[!(duplicated(paste0(datafr$GWAS,"-", datafr$Level))),]
+
+data2<-datafr
+
+data3<-data2[!(data2$GWAS %in% c("CollegeAttainment","YearsEducation")),]
+write.csv(data3, "~/cross_species/SuppTable12_LDSC.csv")
+
+
+zscore_wide <- dcast(data2, Level ~ GWAS, value.var = "Coefficient_z.score")
+rownames(zscore_wide) <- zscore_wide$Level
+zscore_matrix <- as.matrix(zscore_wide[,-1])
+zscore_matrix<-zscore_matrix[,colSums(is.na(zscore_matrix)) == 0]
+
+enrich_wide <- dcast(data2, Level ~ GWAS, value.var = "Enrichment")
+rownames(enrich_wide) <- enrich_wide$Level
+enrich_matrix <- as.matrix(enrich_wide[,-1])
+enrich_matrix<-enrich_matrix[,colSums(is.na(enrich_matrix)) == 0]
+
+pval_wide <- dcast(data2, Level ~ GWAS, value.var = "Coefficient_BH")
+rownames(pval_wide) <- pval_wide$Level
+pval_matrix <- as.matrix(pval_wide[,-1])
+pval_matrix<-pval_matrix[,colSums(is.na(pval_matrix)) == 0]
+
+
+
+# Set desired cell type order
+celltype_order <- c("Shared", "Neuronal", "Excitatory", "Microglia", "Oligodendrocytes", "OPCs")
+# Extract rownames
+row_labels <- rownames(zscore_matrix)
+# Split into group and cell type
+label_df <- data.frame(
+  label = row_labels,
+  group = sub("-.*", "", row_labels),
+  celltype = sub(".*-", "", row_labels),
+  stringsAsFactors = FALSE
+)
+
+label_df$celltype <- factor(label_df$celltype, levels = celltype_order)
+label_df <- label_df[order( label_df$celltype), ]
+
+# Reorder your matrix
+zscore_matrix <- zscore_matrix[label_df$label, ]
+enrich_matrix <- enrich_matrix[label_df$label, ]
+pval_matrix <- pval_matrix[label_df$label, ]
+
+
+
+# How to annotate and split rows
+split<-grepl("T", rownames(zscore_matrix))
+level<-sapply(strsplit(rownames(zscore_matrix),"-"),`[`,1)
+ct<-sapply(strsplit(rownames(zscore_matrix),"-"),`[`,2)
+
+ra<-rowAnnotation(Level=level, cell_type=ct,
+                  col=list(Level=c("R1"= "#B79R00","R2"= "#00BA38","R2.5"= "#00BFC4","R3"= "#619CFF","R4"= "#F564E3",
+"T1"= "#927R00","T2"= "#00952D","T3"= "#4E7DCC","T4"= "#C450B6"), cell_type=c("Oligodendrocytes"="coral3","Excitatory"="cornflowerblue","Inhibitory"="seagreen3","OPCs"="firebrick","Microglia"="mediumorchid3","Endothelial"="grey60","Pericytes"="lightpink", "Astrocytes"="darkgoldenrod1", "Shared"="grey20","Neuronal"="blue")))
+
+# how to annotate and split columns
+rownames(meta)<-meta$Disorder
+meta2<-meta[colnames(zscore_matrix),]
+colnames(zscore_matrix)<-gsub("PGC3","SCZ", colnames(zscore_matrix))
+
+
+
+
+
+
+group_colors <- c( "#FFB3BA",   "#FFDFBA",   "#FFFFBA",   "#BAFFC9",   "#BAE1FF")
+names(group_colors) <- unique(meta2$Group)
+
+# Create the top annotation using valid color codes
+ha <- HeatmapAnnotation(
+  Group = meta2$Group,
+  AgeOnset = meta2$AgeOnset,
+  col = list(
+    AgeOnset = c("Childhood" = "palegreen", "Adult" = "palegreen3", "Late" = "mediumseagreen"),
+    Group = group_colors),
+  annotation_name_side = "left",  # position the annotation name at the left of the annotation
+  gap = unit(2, "mm")
+)
+
+pdf("Heatmap_LDSC_F-T_asterisk.pdf", width = 14, height = 12)
+Heatmap(
+  zscore_matrix,
+  name = "Coefficient z-score",
+  cluster_rows = FALSE,
+  right_annotation = ra,
+  row_split = level,
+  column_split = meta2$Group,
+  top_annotation = ha,
+  show_column_dend = FALSE,
+  rect_gp = gpar(col = "grey20", lwd = 1),
+  col = colorRamp2(c(-1., 0.25, 3, 5), c("royalblue1", "white", "indianred1", "red")),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    pval <- pval_matrix[i, j]
+    sig_text <- if (pval < 0.001) {
+      "***"
+    } else if (pval < 0.01) {
+      "**"
+    } else if (pval < 0.05) {
+      "*"
+    } else {
+      ""
+    }
+    if (sig_text != "") {
+      grid.text(sig_text, x = x, y = y, gp = gpar(fontsize = 20, col = "ivory1"))
+    }
+  }, row_gap = unit(c(1,1,1, 6,1,1), "mm")
+)
+dev.off()
+
+```
+
+
+## Allele Frequency (GWAS)
+```{r, eval=F}
+
+PGC3<-read.table("LDscore/GWAS_summary/PGC3_SCZ_wave3.european.autosome.public.v3_noheader.tsv.gz", header=T)
+PGC3<-PGC3[which(PGC3$PVAL<5e-8),]
+PGC3.gr<-GRanges(paste0("chr",PGC3$CHROM,":", PGC3$POS))
+mcols(PGC3.gr)<-PGC3
+ch<-import.chain("liftover/hg19ToHg38.over.chain")
+PGC3.gr_38<-liftOver(PGC3.gr, ch)
+PGC3.gr_38<-unlist(PGC3.gr_38)
+
+AD<-read.table("~/cross_species/external_data/GWAS/GCST90027158_buildGRCh38.tsv", header=T) #Bellenguez
+AD_sig<-AD[which(AD$p_value<5e-8),]
+AD_sig$start<-AD_sig$base_pair_location
+AD_sig$end<-AD_sig$base_pair_location
+AD_sig<-GRanges(AD_sig)
+seqlevelsStyle(AD_sig)<-"UCSC"
+
+neuroticism<-read.table("GWAS_SumStats/sumstats_neuroticism_ctg_format.txt", header=T) # 
+neuroticism<-neuroticism[which(neuroticism$P < 5e-8),]
+neuroticism.gr<-GRanges(paste0("chr",neuroticism$CHR,":", neuroticism$POS))
+mcols(neuroticism.gr)<-neuroticism
+neuroticism.gr_38<-liftOver(neuroticism.gr, ch)
+neuroticism.gr_38<-unlist(neuroticism.gr_38)
+
+BIP<-read.table("GWAS_SumStats/daner_bip_pgc3_nm_noukbiobank.filtered.txt", header=T)
+BIP<-BIP[which(BIP$P< 5e-8),]
+BIP.gr<-GRanges(paste0("chr",BIP$CHR,":", BIP$BP))
+mcols(BIP.gr)<-BIP
+BIP.gr_38<-liftOver(BIP.gr, ch)
+BIP.gr_38<-unlist(BIP.gr_38)
+
+
+vep_both<-readRDS("VEP_annotation_gnomAD.rds")
+
+PGC3.gr_38$GWAS<-"SCZ"
+AD_sig$GWAS<-"AD"
+neuroticism.gr_38$GWAS<-"Neur"
+BIP.gr_38$GWAS<-"BIP"
+
+
+AD_sig.AF<-GRanges(merge(AD_sig, as.data.frame(mcols(vep_both)), by.x="variant_id", by.y="Existing_variation"))
+BIP.AF<-GRanges(merge(BIP.gr_38[,-1], as.data.frame(mcols(vep_both)), by.x="SNP", by.y="Existing_variation"))
+PGC3.AF<-GRanges(merge(PGC3.gr_38[,-c(1,3)], as.data.frame(mcols(vep_both)), by.x="ID", by.y="Existing_variation"))
+
+GWAS<-c(AD_sig.AF,BIP.AF, PGC3.AF)
+
+
+ol<-findOverlaps(GWAS,PEAKS.rd)
+GWAS$R_mod<-NA
+GWAS[queryHits(ol)]$R_mod<-PEAKS.rd[subjectHits(ol)]$F_mod
+GWAS$ct<-NA
+GWAS[queryHits(ol)]$ct<-PEAKS.rd[subjectHits(ol)]$specificity_ct
+
+mycomp=list(c("R1","R4"), c("R1","R3"))
+pdf("GWAS_alleleFrequency.pdf", width=5,height=8)
+p1<-ggplot(as.data.frame(GWAS[which(GWAS$R_mod!="R0" & GWAS$GWAS=="AD" & GWAS$ct %in% c("Microglia","Shared")),]), aes(x=ct, y=gnomad3_AF, fill=R_mod))+geom_boxplot()+theme_classic()+stat_compare_means()
+p2<-ggplot(as.data.frame(GWAS[which(GWAS$R_mod!="R0" & GWAS$GWAS=="SCZ" & GWAS$ct %in% c("Neuronal","Excitatory","Shared")),]), aes(x=ct, y=gnomad3_AF, fill=R_mod))+geom_boxplot()+theme_classic()+stat_compare_means()
+p3<-ggplot(as.data.frame(GWAS[which(GWAS$R_mod!="R0" & GWAS$GWAS=="BIP" & GWAS$ct %in% c("Neuronal","Shared")),]), aes(x=ct, y=gnomad3_AF, fill=R_mod))+geom_boxplot()+theme_classic()+stat_compare_means()
+plot_grid(p1,p2,p3, nrow=3)
+dev.off()
+
+```
+
+
+
+## Luciferase
+```{r, eval=F}
+
+
+test<-read.csv("/cluster/projects/Cross_Species/CrossSpeciesLuciferase_MedianRepValues07182025.csv")
+test<-test[,-c(12,21)] #non-variant regions
+test$ID<-seq(1,nrow(test))
+test.m<-melt(test, id.vars="ID")
+
+
+
+
+
+
+# Vector of variant names (just the rsIDs, no "_REF"/"_ALT")
+variant_ids <- c("rs3749051", "rs3823381", "rs4569194", "rs2300861",
+                 "rs7127006", "rs10136808", "rs2861344", "rs237475", "rs324017")
+
+# Initialize results list
+results_list <- list()
+df<-test.m[is.na(test.m$value)==F,]
+# Loop through each variant
+for (variant in variant_ids) {
+  
+  # Define group labels
+  ref_label <- paste0(variant, "_REF")
+  alt_label <- paste0(variant, "_ALT")
+  
+  # Subset relevant data
+  sub_df <- subset(df, variable %in% c("Control", ref_label, alt_label))
+  sub_df$variable <- factor(sub_df$variable, levels = c(ref_label, alt_label, "Control"))  # REF as reference
+  
+  # Fit linear model
+  model <- lm(value ~ variable, data = sub_df)
+  summary_model <- summary(model)
+  
+  # Extract p-values
+  coefs <- summary_model$coefficients
+  B_REF_vs_CTRL<- summary(model)$coefficients["variableControl", "Estimate"]
+  p_REF_vs_CTRL <- summary(model)$coefficients["variableControl", "Pr(>|t|)"]
+  t_REF_vs_CTRL <- summary(model)$coefficients["variableControl", "t value"]
+  
+  B_REF_vs_ALT<- summary(model)$coefficients[paste0("variable",alt_label), "Estimate"]
+  p_REF_vs_ALT <-summary(model)$coefficients[paste0("variable",alt_label), "Pr(>|t|)"]
+  t_REF_vs_ALT <-summary(model)$coefficients[paste0("variable",alt_label), "t value"]
+
+  # Store in list
+  results_list[[variant]] <- data.frame(
+    Variant = variant,
+    B_REF_vs_CTRL=B_REF_vs_CTRL,
+    t_REF_vs_CTRL=t_REF_vs_CTRL,
+    p_REF_vs_CTRL = ifelse(length(p_REF_vs_CTRL) == 0, NA, p_REF_vs_CTRL),
+    
+    B_REF_vs_ALT =B_REF_vs_ALT,
+    t_REF_vs_ALT =t_REF_vs_ALT,
+    p_REF_vs_ALT = ifelse(length(p_REF_vs_ALT) == 0, NA, p_REF_vs_ALT)
+    )
+}
+
+# Combine results into a single data frame
+results_df <- do.call(rbind, results_list)
+
+# Adjust p-values (optional)
+results_df$p_REF_vs_ALT_FDR <- p.adjust(results_df$p_REF_vs_ALT, method = "BH")
+results_df$p_REF_vs_CTRL_FDR <- p.adjust(results_df$p_REF_vs_CTRL, method = "BH")
+
+
+write.csv(results_df, "~/cross_species/SuppTable13_Luciferase_results.csv")
+
+```
+
+
+# Supplemental Code:
+## Comparison of liftover tools
+
+install
+```{bash, eval=F}
+git clone https://github.com/ComparativeGenomicsToolkit/hal.git
+
+mamba create -n HAL
+mamba activate HAL
+mamba install conda-forge::hdf5
+#mamba install bioconda::sonlib
+mamba install -c conda-forge gxx_linux-64
+mamba install -c conda-forge zlib
+
+export PATH=miniforge3/envs/HAL/bin:${PATH} 
+export h5prefix=-prefix=$CONDA_PREFIX
+
+git clone https://github.com/ComparativeGenomicsToolkit/sonLib.git
+pushd sonLib && make && popd
+
+cd hal
+make
+```
+
+
+use
+```{bash, eval=F}
+mamba activate HAL
+
+export PATH=software/hal/bin:${PATH}
+export PYTHONPATH=miniforge3/envs/HAL/bin/python:${PYTHONPATH}
+```
+
+
+
+### HAL
+```{bash, eval=F}
+
+awk 'BEGIN { OFS="\t" } { if ($1 !~ /^chr/) $1="chr"$1; print }' mouse_toliftover.bed > mouse_toliftover.chr.bed
+awk 'BEGIN { OFS="\t" } { if ($1 !~ /^chr/) $1="chr"$1; print }' cat_toliftover.bed > cat_toliftover.chr.bed
+
+
+sbatch -o hal.test --wrap="halLiftover --bedType 3  ~/cross_species/external_data/447-mammalian-2022v1.hal Mus_musculus mouse_toliftover.chr.bed Homo_sapiens mouse_postliftover.bed"
+
+
+sbatch -o calf.out --wrap="halLiftover --bedType 3  ~/cross_species/external_data/447-mammalian-2022v1.hal Bos_taurus calf_toliftover.bed Homo_sapiens calf_postliftover.bed"
+sbatch -o cat.out --wrap="halLiftover --bedType 3  ~/cross_species/external_data/447-mammalian-2022v1.hal Felis_catus cat_toliftover.chr.bed Homo_sapiens cat_postliftover.bed"
+sbatch -o foal.out --wrap="halLiftover --bedType 3  ~/cross_species/external_data/447-mammalian-2022v1.hal Equus_caballus foal_toliftover.bed Homo_sapiens foal_postliftover.bed"
+sbatch -o macaque.out --wrap="halLiftover --bedType 3  ~/cross_species/external_data/447-mammalian-2022v1.hal Macaca_mulatta macaque_toliftover.bed Homo_sapiens macaque_postliftover.bed"
+sbatch -o marmoset.out --wrap="halLiftover --bedType 3  ~/cross_species/external_data/447-mammalian-2022v1.hal Callithrix_jacchus marmoset_toliftover.bed Homo_sapiens marmoset_postliftover.bed"
+sbatch -o rabbit.out --wrap="halLiftover --bedType 3  ~/cross_species/external_data/447-mammalian-2022v1.hal Oryctolagus_cuniculus rabbit_toliftover.bed Homo_sapiens rabbit_postliftover.bed"
+
+
+
+
+# testing what liftover looks like for just one peak
+grep "173654" mouse_postliftover.bed > Test_Xkr4_link.bed
+```
+
+```{r, eval=F}
+
+test<-read.table("~/cross_species/LINKS/halLiftover/Test_Xkr4_link.bed")
+colnames(test)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end")
+test<-GRanges(test)
+
+a<-reduce(test, min.gapwidth=50)
+
+
+
+
+
+test<-read.table("~/cross_species/LINKS/halLiftover/mouse_postliftover.bed")
+colnames(test)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end")
+test<-GRanges(test)
+
+m6<-read.table("~/cross_species/LINKS/liftover/REGION_lift/mouse_postliftover.bed")
+colnames(m6)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end", "Map")
+m6$seqnames<-paste0("chr", m6$seqnames)
+m6<-GRanges(m6)
+
+
+test$ID<-paste0(test$gene,"-",test$original.seq,":",test$original.start)
+m6$ID<-paste0(m6$gene,"-",m6$original.seq,":",m6$original.start)
+
+#baseline. How many links liftover to hg38? about double for hal
+length(unique(test$ID))
+#[1] 69897
+length(unique(m6$ID))
+#[1] 34070
+
+
+#How many peaks? 2x as many
+length(unique(test$original.start))
+#50703
+length(unique(m6$original.start))
+#24652
+
+
+
+# Does hal liftover to more than one region
+a<-c()
+IDs<-unique(test$ID)
+for(i in 1:length(IDs)){
+  a<-c(a,length(unique(seqnames(test[which(test$ID==IDs[i])]))))
+}
+
+MULTI<-test[which(test$ID %in% IDs[which(a>1)]),] #get links where it lifted over to >1 chr
+
+
+#peaks. Looking at the same peaks that lifted over for both methods, how much coverage do you get
+red<-reduce(test[which(test$original.start %in% m6$original.start),])
+peak<-unique(m6[which(m6$original.start %in% test$original.start),])
+
+intersected <- GenomicRanges::intersect(red, peak)
+coverage    <- sum(width(intersected))
+ucsc_length <- sum(width(peak))
+
+# Compute the percentage coverage
+(coverage / ucsc_length) * 100
+#6.8% coverage
+
+
+
+STARTS<-unique(test[which(test$original.start %in% m6$original.start),]$original.start)
+cov<-list()
+for(i in 1:length(STARTS)){
+  red<-reduce(test[which(test$original.start ==STARTS[i]),])
+  peak<-unique(m6[which(m6$original.start ==STARTS[i]),])
+  
+  intersected <- GenomicRanges::intersect(red, peak)
+  coverage    <- sum(width(intersected))
+  ucsc_length <- sum(width(peak))
+
+  cov_U<-(coverage / ucsc_length) * 100
+  cov_H<-(coverage / sum(width(red))) *100
+  cov[[i]]<-c(cov_U, cov_H, STARTS[i])
+}
+
+cov2<-do.call(rbind, cov)
+colnames(cov2)<-c("Perc_UCSC_cov","Perc_HAL_cov","peak")
+cov2<-as.data.frame(cov2)
+
+pdf("hal-vs-UCSC_liftover.pdf")
+ggplot(cov2, aes(x=Perc_UCSC_cov,y=Perc_HAL_cov))+geom_point()+theme_classic()
+dev.off()
+```
+
+
+### compare UCSC chain
+```{bash, eval=F}
+
+
+CrossMap.py region -r 0.25 cross_species/mouse/mm10ToHg38.over.chain.gz   mouse_toliftover.bed mouse_postliftover0.25.bed "
+CrossMap.py region -r 0.5 cross_species/mouse/mm10ToHg38.over.chain.gz   mouse_toliftover.bed mouse_postliftover0.5.bed "
+CrossMap.py region -r 0.7 cross_species/mouse/mm10ToHg38.over.chain.gz   mouse_toliftover.bed mouse_postliftover0.7.bed "
+CrossMap.py region -r 0.8 cross_species/mouse/mm10ToHg38.over.chain.gz   mouse_toliftover.bed mouse_postliftover0.8.bed "
+CrossMap.py region -r 0.9 cross_species/mouse/mm10ToHg38.over.chain.gz   mouse_toliftover.bed mouse_postliftover0.9.bed "
+
+
+
+```
+
+
+```{r, eval=F}
+m25<-read.table("~/cross_species/LINKS//halLiftover/compare_UCSC/mouse_postliftover0.25.bed")
+colnames(m25)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end", "Map")
+m25$seqnames<-paste0("chr", m25$seqnames)
+m25<-GRanges(m25)
+
+
+m5<-read.table("~/cross_species/LINKS//halLiftover/compare_UCSC/mouse_postliftover0.5.bed")
+colnames(m5)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end", "Map")
+m5$seqnames<-paste0("chr", m5$seqnames)
+m5<-GRanges(m5)
+
+
+m7<-read.table("~/cross_species/LINKS//halLiftover/compare_UCSC/mouse_postliftover0.7.bed")
+colnames(m7)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end", "Map")
+m7$seqnames<-paste0("chr", m7$seqnames)
+m7<-GRanges(m7)
+
+
+m8<-read.table("~/cross_species/LINKS//halLiftover/compare_UCSC/mouse_postliftover0.8.bed")
+colnames(m8)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end", "Map")
+m8$seqnames<-paste0("chr", m8$seqnames)
+m8<-GRanges(m8)
+
+
+m9<-read.table("~/cross_species/LINKS//halLiftover/compare_UCSC/mouse_postliftover0.9.bed")
+colnames(m9)<-c("seqnames","start","end","wdith","strand","gene","mouse.score","mouse.q","mouse.dist","original.seq","original.start","original.end", "Map")
+m9$seqnames<-paste0("chr", m9$seqnames)
+m9<-GRanges(m9)
+
+
+UCSC<-list(m25,m5,m7,m8,m9)
+UCSC<-lapply(UCSC, function(x) {
+  x<-x[!(duplicated(x$original.start))]
+  return(x)})
+
+
+
+
+# This just gets you whether or not the same peaks were lifted over. Not if they lifted over to the same position
+HAL<-test[!(duplicated(test$original.start)),]
+
+olap<-lapply(UCSC, function(x){
+  starts<-unique(x$original.start)
+  ol<-length(unique(starts[starts %in% HAL$original.start]))
+  return(ol)
+}  )
+
+olap<-do.call(c, olap)
+olap.df<-data.frame(olap=olap, num_lifted=lengths(UCSC), map.ratio=c("0.25","0.5","0.7","0.8","0.9"))
+olap.df$PropHALOlap<-olap.df$olap/olap.df$num_lifted
+olap.df$map.ratio<-as.numeric(olap.df$map.ratio)
+pdf("HAL-vs-UCSC_liftover_MapRatio.pdf", width=6,height=4)
+p1<-ggplot(olap.df, aes(x=map.ratio, y=PropHALOlap))+geom_point()+theme_classic() +ylab("Prop of UCSC liftover regions overlapping HAL liftover")
+p2<-ggplot(olap.df, aes(x=map.ratio, y=num_lifted))+geom_point()+theme_classic()+geom_hline(yintercept=length(HAL), color="red")
+plot_grid(p1,p2)
+dev.off()
+
+
+
+names(UCSC)<-c("MR0.25","MR0.5","MR0.7","MR0.8","MR0.9")
+result_list <- lapply(names(UCSC), function(threshold) {
+  ucsc_gr <- UCSC[[threshold]]
+  # Subset HAL to only peaks present in this UCSC set.
+  hal_sub <- test[which(test$original.start %in% ucsc_gr$original.start)]
+  # Split the GRanges objects by original.start.
+  ucsc_split <- split(ucsc_gr, ucsc_gr$original.start)
+  hal_split  <- split(hal_sub, hal_sub$original.start)
+  # For each peak, calculate the fraction of the UCSC region overlapped by HAL intervals.
+  overlap_fraction <- sapply(names(ucsc_split), function(peak_id) {
+    # Merge overlapping UCSC intervals for this peak.
+    ucsc_peak <- reduce(ucsc_split[[peak_id]])
+    ucsc_width <- sum(width(ucsc_peak))
+    # If no HAL intervals exist for this peak, return 0.
+    if (!(peak_id %in% names(hal_split))) {
+      return(0)
+    }
+    # Merge HAL intervals for this peak.
+    hal_peak <- reduce(hal_split[[peak_id]])
+    # Compute the intersection between the UCSC and HAL intervals.
+    inter <- GenomicRanges::intersect(ucsc_peak, hal_peak)
+    inter_width <- sum(width(inter))
+    # Return the overlap fraction.
+    inter_width / ucsc_width
+})
+  
+df<-data.frame(threshold = threshold,
+    original.start = names(overlap_fraction),
+    overlap_fraction = overlap_fraction,
+    stringsAsFactors = FALSE
+  )
+})
+
+# Combine the results from all thresholds into one data frame.
+result_df <- do.call(rbind, result_list)
+result_df$MP_threshold<-as.numeric(sapply(strsplit(result_df$threshold,"0."), `[`,2))
+pdf("HAL-UCSC_liftover_by_threshold_PercSeqCovered.pdf")
+ggplot(result_df, aes(x=threshold, y=overlap_fraction))+geom_boxplot()+theme_classic()
+dev.off()
+
+
+table(result_df[which(result_df$overlap_fraction==0),]$threshold)
+
+#MR0.25  MR0.5  MR0.7  MR0.8  MR0.9 
+#   928    652    483    397    307 
+
+
+# how many peaks lift over to multiple chromosomes
+UCSC_2<-list(m25,m5,m7,m8,m9, test)
+numCHR<-lapply(UCSC_2, function(x){
+  tmp<-unique(x)
+  tab<-table(tmp$original.start,seqnames(tmp))
+  rs<-rowSums(tab != 0)
+  names(rs[rs>1])
+})
+
+unlist(numCHR)
+# 6 5 4 4 2 2257        Not really an issue
+
+
+
+numolapHuman<-lapply(UCSC_2, function(x){
+  tmp<-x[width(x)<5000,]
+  length(unique(subsetByOverlaps(links_list[[8]], tmp, maxgap=100 )))
+})
+olapHuman<-lapply(UCSC_2, function(x){
+  tmp<-x[width(x)<5000,]
+  length(unique(subsetByOverlaps(links_list[[8]], tmp, maxgap=100 )))/length(unique(tmp$original.start))
+})
+df2<-data.frame(LO=c("UCSC0.25","UCSC0.5","UCSC0.7","UCSC0.8","UCSC0.9","HAL"), olapHuman=unlist(olapHuman), Num=unlist(numolapHuman))
+pdf("HAL-UCSC_liftover_by_threshold_PercOlapHuman.pdf", width=5,height=8)
+p1<-ggplot(df2, aes(x=LO, y=olapHuman))+geom_bar(stat="identity")+theme_classic()+xlab("liftover")+ylab("Prop overlap Human")+theme(axis.text.x=element_text(angle=90))
+p2<-ggplot(df2, aes(x=LO, y=Num))+geom_bar(stat="identity")+theme_classic()+xlab("liftover")+ylab("Num overlap Human")+theme(axis.text.x=element_text(angle=90))
+plot_grid(p1,p2, nrow=2)
+dev.off()
+
+```
+
+```{r, eval=F}
+check<-result_df[which(result_df$overlap_fraction<0.1 & result_df$overlap_fraction>0 & result_df$threshold=="MR0.9"),]
+subsetByOverlaps(m25[which(m25$original.start %in% check$original.start),], LINKS[which(LINKS$num_species>5),]) #get links where not a lot of sequence lifted over with HAL but are conserved
+
+dat<-readRDS("~/scAnalysis/NPC_multi/210330_filtered_multi.rds")
+DefaultAssay(dat)<-"ATAC"
+enc4<-read.table("~/cross_species/GRCh38-cCREs_SCREENv4.bed")
+colnames(enc4)<-c("seqnames","start","end","ID1","ID2","cCRE")
+enc4<-GRanges(enc4)
+enc4$encodeLabel<-enc4$cCRE
+
+
+region<-unique(m25[which(m25$original.start==133397251),])
+region<-resize(region,width=50000, fix="center")
+human<-Bed_PeakPlot(links_list[[8]], region)+ylab("Human")
+HAL<-Bed_PeakPlot(test, region)+ylab("HAL")
+UCSC25<-Bed_PeakPlot(m25[which(width(m25)<5000),], region)+ylab("MR0.25")
+UCSC5<-Bed_PeakPlot(m9[which(width(m9)<5000),],region)+ylab("MR0.9")
+
+
+CRE<-Bed_PeakPlot(enc4, region, group.by="encodeLabel")+ylab("cCREs")+scale_color_manual(values=c("PLS"= "red","pELS"="orange","dELS"="gold","CA-H3K4me33"="pink","CA-CTCF"= "royalblue", "CA"="forestgreen", "TF"="purple","CA-TF"="darkorchid4"))+theme(legend.position="none")
+
+gp<-AnnotationPlot(dat, region)
+
+p1<-CombineTracks(plotlist=list(human,HAL,UCSC25,UCSC5,CRE,gp), heights=c(1,1,1,1,1,1))
+pdf("Peak_liftover-region_mouse_UCSC-HAL.pdf", width=5,height=4)
+p1
+dev.off()
+```
+
