@@ -1,7 +1,7 @@
 # Single Cell Multiomics Across Nine Mammals Reveals Cell Type Specific Regulatory Conservation in the Brain
 
 ## Code Availability
-All code generated for Anderson et al. 2025 is availble in this repository. Click [HERE](https://aanderson54.github.io/snMulti_CrossSpeciesBrain/index.html) to view code
+All code generated for this manuscript is availble in this repository. Click [HERE](https://aanderson54.github.io/snMulti_CrossSpeciesBrain/index.html) to view code
 
 
 
