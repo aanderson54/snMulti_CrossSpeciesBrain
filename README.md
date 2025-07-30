@@ -3,7 +3,10 @@
 ## Code Availability
 All code generated for this manuscript is availble in this repository. Click [HERE](https://aanderson54.github.io/snMulti_CrossSpeciesBrain/index.html) to view code
 
-<img src="https://github.com/aanderson54/snMulti_CrossSpeciesBrain/blob/main/images/Figure1.png" width="700" />
+
+<p align="center">
+  <img src="https://github.com/aanderson54/snMulti_CrossSpeciesBrain/blob/main/images/Figure1.png" width="700" alt="Figure 1">
+</p>
 
 
 #### Abstract
